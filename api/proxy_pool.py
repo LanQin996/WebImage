@@ -200,9 +200,8 @@ def create_router() -> APIRouter:
                 account_service.bind_unbound_accounts()
                 return {**build_pool_payload(), "affected": len(ids)}
 
-            # 先移除全部目标，再改绑；不能把账号临时改绑到另一条待删除代理。
-            for proxy_id in ids:
-                proxy_pool.delete_entry(proxy_id)
+            # 先原子移除全部目标，再改绑；不能把账号临时改绑到另一条待删除代理。
+            proxy_pool.delete_entries(ids)
             reassigned = sum(account_service.reassign_proxy_bindings(proxy_id) for proxy_id in ids)
             for entry in entries:
                 proxy_subscriptions.on_proxy_deleted(entry)
