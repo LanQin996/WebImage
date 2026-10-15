@@ -37,13 +37,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
+# 注册协议中的 Sentinel 脚本由 Node 子进程执行。
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
-COPY config.json ./
+COPY config.docker.json ./config.json
 COPY VERSION ./
 COPY api ./api
 COPY services ./services

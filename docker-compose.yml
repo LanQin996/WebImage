@@ -19,7 +19,7 @@ services:
   # ------------------------------------------------------------------
   sentinel-solver:
     # 默认拉取 CI 推送的镜像；本地改了 solver 代码时用 --build 重新构建
-    image: ${SENTINEL_SOLVER_IMAGE:-ghcr.io/239573049/webimage-sentinel-solver:latest}
+    image: ${SENTINEL_SOLVER_IMAGE:-ghcr.io/lanqin996/webimage-sentinel-solver:latest}
     build:
       context: .
       dockerfile: docker/solver.Dockerfile
@@ -73,7 +73,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/239573049/webimage:latest
+    image: ghcr.io/lanqin996/webimage:latest
     container_name: chatgpt2api
     restart: unless-stopped
     depends_on:

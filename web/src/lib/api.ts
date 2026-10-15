@@ -1,4 +1,251 @@
 import { httpRequest, request } from "@/lib/request";
+import webConfig from "@/constants/common-env";
+import { getStoredAuthKey } from "@/store/auth";
+
+// ── Protocol registration ─────────────────────────────────────────
+
+export type RegisterSettings = {
+  enabled: boolean;
+  mail_api_base: string;
+  mail_auth_mode: "none" | "x-admin-auth" | "x-api-key";
+  mail_auth_key: string;
+  mail_domain: string;
+  proxy_pool_text: string;
+  otp_max_wait: number;
+  otp_poll_interval: number;
+  otp_total_budget: number;
+  token_source: "platform" | "codex";
+  auto_locale_from_ip: boolean;
+  anon_bootstrap: boolean;
+  send_sentinel_on_email_otp_validate: boolean;
+  default_count: number;
+  default_concurrency: number;
+  fixed_password: string;
+  keeper_enabled: boolean;
+  keeper_target_accounts: number;
+  keeper_target_quota: number;
+  keeper_min_quota: number;
+  keeper_estimate_quota: number;
+  keeper_check_interval: number;
+  keeper_max_per_round: number;
+  keeper_concurrency: number;
+  keeper_daily_limit: number;
+  keeper_source_type: string;
+  keeper_fail_threshold: number;
+  keeper_fail_cooldown_minutes: number;
+  ready: boolean;
+  proxy_count: number;
+  domain_count: number;
+  has_mail_auth_key: boolean;
+};
+
+export type NodeHealth = {
+  available: boolean;
+  version: string;
+  executable: string;
+  assets_ok: boolean;
+  error: string;
+};
+
+export type KeeperStatus = {
+  running: boolean;
+  enabled: boolean;
+  valid_count: number;
+  valid_quota: number;
+  avg_quota: number;
+  inflight: number;
+  daily_used: number;
+  daily_success: number;
+  daily_limit: number;
+  target_accounts: number;
+  target_quota: number;
+  consecutive_failures: number;
+  cooldown_seconds_left: number;
+  last_round: { at: number; message: string };
+  node: NodeHealth;
+};
+
+export type RegisterJobResult = {
+  email: string;
+  ok: boolean;
+  added?: boolean;
+  skipped?: boolean;
+  error?: string;
+};
+
+export type RegisterJobSnapshot = {
+  job_id: string;
+  source: "manual" | "keeper";
+  total: number;
+  issued: number;
+  done: number;
+  success: number;
+  failed: number;
+  current_email: string;
+  message: string;
+  finished: boolean;
+  error: string | null;
+  daily_blocked: boolean;
+  results: RegisterJobResult[];
+  last_seq: number;
+};
+
+export async function fetchRegisterSettings() {
+  return httpRequest<{ settings: RegisterSettings }>("/api/register/settings");
+}
+
+export async function updateRegisterSettings(updates: Partial<RegisterSettings>) {
+  return httpRequest<{ settings: RegisterSettings }>("/api/register/settings", {
+    method: "POST",
+    body: updates,
+  });
+}
+
+export async function testRegisterMail(payload: {
+  mail_api_base?: string;
+  mail_auth_mode?: string;
+  mail_auth_key?: string;
+  mail_domain?: string;
+  use_proxy?: boolean;
+}) {
+  return httpRequest<{ result: { ok: boolean; address: string; via_proxy: boolean } }>(
+    "/api/register/test-mail",
+    {
+      method: "POST",
+      body: payload,
+    },
+  );
+}
+
+export type ProxyProbeResult = {
+  proxy: string;
+  ok: boolean;
+  ip: string;
+  status: number;
+  error: string;
+};
+
+export async function testRegisterProxy(payload: { proxy_pool_text?: string; limit?: number }) {
+  return httpRequest<{
+    parsed: number;
+    tested: number;
+    available: number;
+    results: ProxyProbeResult[];
+  }>("/api/register/test-proxy", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export async function startRegister(body: { count: number; concurrency: number; password?: string }) {
+  return httpRequest<{ job_id: string; total: number }>("/api/register/start", {
+    method: "POST",
+    body,
+  });
+}
+
+export async function fetchRegisterProgress(jobId: string) {
+  return httpRequest<RegisterJobSnapshot>(`/api/register/progress/${jobId}`);
+}
+
+export async function fetchLatestRegisterJob() {
+  return httpRequest<{ job: RegisterJobSnapshot | null }>("/api/register/jobs/latest");
+}
+
+export async function stopRegister(jobId: string) {
+  return httpRequest<{ ok: boolean }>(`/api/register/stop/${jobId}`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function fetchKeeperStatus() {
+  return httpRequest<{ keeper: KeeperStatus }>("/api/register/keeper");
+}
+
+export type RegisterLogEntry = {
+  seq: number;
+  ts: number;
+  level: "info" | "step" | "success" | "warn" | "error" | string;
+  message: string;
+  email: string;
+};
+
+/**
+ * 订阅注册任务实时日志（SSE）。
+ * 原生 EventSource 不支持自定义鉴权头，因此用 fetch + ReadableStream 解析 SSE。
+ * 返回取消函数；连接结束（收到 done）会自动关闭。
+ */
+export function subscribeRegisterLogs(
+  jobId: string,
+  handlers: {
+    onLog?: (entry: RegisterLogEntry) => void;
+    onStatus?: (snapshot: RegisterJobSnapshot) => void;
+    onDone?: (snapshot: RegisterJobSnapshot) => void;
+    onError?: (error: string) => void;
+  },
+  after = 0,
+): () => void {
+  const controller = new AbortController();
+
+  const run = async () => {
+    const authKey = await getStoredAuthKey();
+    const base = webConfig.apiUrl.replace(/\/$/, "");
+    const resp = await fetch(`${base}/api/register/logs/${jobId}?after=${after}`, {
+      headers: authKey ? { Authorization: `Bearer ${authKey}` } : {},
+      signal: controller.signal,
+    });
+    if (!resp.ok || !resp.body) {
+      handlers.onError?.(`日志流连接失败 (${resp.status})`);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+
+        let event = "message";
+        let dataText = "";
+        for (const line of raw.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataText += line.slice(5).trim();
+        }
+        if (!dataText) continue;
+        let data: unknown;
+        try {
+          data = JSON.parse(dataText);
+        } catch {
+          continue;
+        }
+        if (event === "log") handlers.onLog?.(data as RegisterLogEntry);
+        else if (event === "status") handlers.onStatus?.(data as RegisterJobSnapshot);
+        else if (event === "done") {
+          handlers.onDone?.(data as RegisterJobSnapshot);
+          return;
+        }
+      }
+    }
+    if (!controller.signal.aborted) handlers.onError?.("日志流连接已断开");
+  };
+
+  void run().catch((error: unknown) => {
+    if ((error as { name?: string })?.name === "AbortError") return;
+    handlers.onError?.(error instanceof Error ? error.message : "日志流异常");
+  });
+
+  return () => controller.abort();
+}
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";

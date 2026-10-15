@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, image_tasks, proxy_pool, system
+from api import accounts, ai, image_tasks, proxy_pool, register, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.account_service import account_service
@@ -19,6 +19,8 @@ from services.image_service import start_image_cleanup_scheduler
 from services.metrics_service import ai_metrics
 from services.proxy_pool_service import proxy_pool as proxy_pool_store
 from services.proxy_subscription_service import proxy_subscriptions
+from services.register_protocol.service import register_manager
+from services.register_runner import pool_keeper, start_pool_keeper
 
 
 def create_app() -> FastAPI:
@@ -39,16 +41,20 @@ def create_app() -> FastAPI:
         pool_thread = proxy_pool_store.start_health_loop(stop_event)
         # 订阅定时刷新；启用内核时首轮把配置推给 mihomo
         subscription_thread = proxy_subscriptions.start_loop(stop_event)
+        keeper_thread = start_pool_keeper(stop_event)
         backup_service.start()
         config.cleanup_old_images()
         try:
             yield
         finally:
             stop_event.set()
+            pool_keeper.wake()
+            register_manager.stop_all()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             pool_thread.join(timeout=1)
             subscription_thread.join(timeout=1)
+            keeper_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
@@ -76,6 +82,7 @@ def create_app() -> FastAPI:
 
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
+    app.include_router(register.create_router())
     app.include_router(image_tasks.create_router())
     app.include_router(proxy_pool.create_router())
     app.include_router(system.create_router(app_version))

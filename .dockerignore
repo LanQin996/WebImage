@@ -1,5 +1,6 @@
 .git
 .gitignore
+config.json
 .idea
 .venv
 __pycache__
@@ -9,6 +10,7 @@ __pycache__
 
 web/.next
 web/node_modules
+web/out
 
 assets
 README.md

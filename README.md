@@ -20,7 +20,7 @@
 ### Docker 运行（推荐）
 
 ```bash
-git clone https://github.com/239573049/WebImage.git
+git clone https://github.com/LanQin996/WebImage.git
 cd WebImage
 cp .env.example .env     # 至少填 CHATGPT2API_AUTH_KEY 与 SENTINEL_SOLVER_KEY
 docker compose up -d --build
@@ -124,7 +124,7 @@ SENTINEL_SOLVER_KEY=your-secret python scripts/sentinel_solver.py --port 8788 --
 启动后端：
 
 ```bash
-git clone https://github.com/239573049/WebImage.git
+git clone https://github.com/LanQin996/WebImage.git
 cd WebImage
 uv sync
 uv run main.py
@@ -205,6 +205,13 @@ environment:
 - 支持多种导入方式：OAuth 登录、`access_token`（粘贴 / TXT）、Session JSON、Codex 认证 JSON、账号 JSON 文件（本项目 / CPA / `sub2api` 导出）、`sub2api` 导出 JSON（粘贴或选文件）、远程 CPA 服务器、`sub2api` 服务器
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
 - 导入 `sub2api` 导出 JSON 时会展开 `accounts[].credentials`，保留 `refresh_token` / `id_token` / 套餐信息，并自动跳过非 OpenAI 平台的账号
+
+### 注册机
+
+- 后台「注册机」页面提供临时邮箱配置、代理池、批量任务进度与日志，以及按有效账号数或图片额度自动补号的水位守护。
+- 水位守护默认关闭；先配置邮件 API 与可用域名，再手动启动注册或开启自动补号。注册成功的账号会导入现有号池。
+- 注册协议的 Sentinel 步骤需要 Node.js 运行时；项目 Docker 镜像已包含，非 Docker 部署需自行安装 Node.js 22。
+- 注册配置保存在 `config.json` 的 `register_settings`，含邮件 API 凭据；请仅向管理员开放后台与配置文件。
 
 ### 实验性 / 规划中
 
