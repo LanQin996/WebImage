@@ -23,9 +23,11 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"status": "限流", "quota": 1}
             )
         )
+        # 已确认耗尽：quota=0 且带 image_gen 快照。
+        # 无快照的 quota=0 是「额度未知」，按设计仍可被选中去补探测。
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "正常", "quota": 0}
+                {"status": "正常", "quota": 0, "limits_progress": [{"feature_name": "image_gen", "remaining": 0}]}
             )
         )
         self.assertTrue(AccountService._is_image_account_available({"status": "正常", "quota": 1}))

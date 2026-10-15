@@ -336,11 +336,12 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int | None, str | None]:
+        """返回 (剩余次数, 恢复时间)；没有 image_gen 读数时返回 `(None, None)` 表示"读不到"。"""
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
                 return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
-        return 0, None
+        return None, None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
@@ -415,15 +416,18 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
+        # 读不到 image_gen 时 quota 未知：对外仍写 0，但配合空 limits_progress 表示"未读到"，
+        # 不能当成"配额耗尽"直接封成限流号
+        quota_known = quota is not None
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
-            "quota": quota,
+            "quota": quota if quota_known else 0,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": "限流" if quota == 0 else "正常",
+            "status": "限流" if (quota_known and quota == 0) else "正常",
         }
         logger.debug({
             "event": "backend_user_info_result",

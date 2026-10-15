@@ -45,8 +45,16 @@ class _FakeHealthRepo:
 
 
 def _make_service(plans, quota: int = 1000, states=None) -> AccountService:
+    # 带上 image_gen 快照表示“已探测过”：quota=0 才是确认耗尽，而不是从未探测
+    # 成功的「额度未知」态（后者按设计仍会被选中去补一次探测）。
     accounts = [
-        {"access_token": f"tok{i}", "status": "正常", "quota": quota, "type": plan}
+        {
+            "access_token": f"tok{i}",
+            "status": "正常",
+            "quota": quota,
+            "type": plan,
+            "limits_progress": [{"feature_name": "image_gen", "remaining": quota}],
+        }
         for i, plan in enumerate(plans)
     ]
     service = AccountService(_FakeStorage(accounts))

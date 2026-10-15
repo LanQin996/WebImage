@@ -31,6 +31,16 @@ class ImageQuotaBusyError(RuntimeError):
     """
 
 
+def _has_image_gen_reading(updates: dict) -> bool:
+    limits_progress = updates.get("limits_progress")
+    if not isinstance(limits_progress, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("feature_name") == "image_gen"
+        for entry in limits_progress
+    )
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -145,12 +155,30 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
+    def _quota_known(account: dict) -> bool:
+        """额度是否已知（非「额度未知」态）。
+
+        「额度未知」定义为 quota == 0 且 limits_progress 为空：探测成功时上游
+        一定会带回 image_gen 条目，所以 limits_progress 为空只可能是从未探测
+        成功（例如注册后首次刷新被 Cloudflare 拦截）。真正耗尽的账号
+        quota == 0，但 limits_progress 非空且 image_gen 的 remaining 为 0。
+        """
+        if not isinstance(account, dict):
+            return False
+        if account.get("limits_progress"):
+            return True
+        return int(account.get("quota") or 0) > 0
+
+    @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
-        return int(account.get("quota") or 0) > 0
+        # 额度未知（quota=0 且 limits_progress 为空）仍算候选：取号时会经
+        # _validate_account_cached 重新探测并写回真实额度；已确认耗尽的账号
+        # （quota=0 但 limits_progress 非空）才真正不可用。
+        return int(account.get("quota") or 0) > 0 or not AccountService._quota_known(account)
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -982,7 +1010,10 @@ class AccountService:
         return max(1, int(config.image_account_concurrency or 1))
 
     def _remaining_quota_locked(self, token: str) -> int:
-        return max(0, int((self._accounts.get(token) or {}).get("quota") or 0))
+        account = self._accounts.get(token) or {}
+        if not self._quota_known(account):
+            return 1
+        return max(0, int(account.get("quota") or 0))
 
     def _account_capacity_locked(self, token: str, health_state: str) -> int:
         """该账号当前可再接收的并发数上限（并发上限与剩余次数取小）。"""
@@ -1152,6 +1183,9 @@ class AccountService:
             if state == "open":
                 continue
             quota = max(0, int(item.get("quota") or 0))
+            if not self._quota_known(item):
+                # 额度未知的账号先贡献 1，让调度器派一次探测请求把它解析出来
+                quota = 1
             total += min(self._account_max_concurrency(state, item.get("type")), quota)
         return total
 
@@ -1318,6 +1352,30 @@ class AccountService:
                 if item.get("status") == "正常"
                    and (token := item.get("access_token") or "")
             ]
+
+    def list_unknown_quota_tokens(self) -> list[str]:
+        """额度未知、但账号状态正常的 token，用于优先触发补探测。
+
+        只取「正常」态：异常/禁用账号本来就该被排除，把它们带进巡检会
+        让本该被暂缓处理的失效 token 提前进入移除流程。
+        """
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == "正常"
+                   and not self._quota_known(item)
+                   and (token := item.get("access_token") or "")
+            ]
+
+    def unknown_quota_count(self) -> int:
+        """状态正常但额度未知的账号数，供水位守护估算总额度缺口。"""
+        with self._lock:
+            return sum(
+                1
+                for item in self._accounts.values()
+                if item.get("status") == "正常" and not self._quota_known(item)
+            )
 
     @staticmethod
     def _account_payload_token(item: dict) -> str:
@@ -1489,7 +1547,16 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
+            merged_updates = dict(updates)
+            if (
+                "limits_progress" in merged_updates
+                and not _has_image_gen_reading(merged_updates)
+                and self._quota_known(current)
+            ):
+                # 降级探测（拿不到 image_gen 条目）不能覆盖已确认的额度读数
+                for key in ("quota", "limits_progress", "restore_at", "status"):
+                    merged_updates.pop(key, None)
+            account = self._normalize_account({**current, **merged_updates, "access_token": access_token})
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
@@ -1519,6 +1586,20 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
+
+    def _record_refresh_failure(self, access_token: str, error: object) -> None:
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["last_refresh_error"] = str(error or "")[:500]
+            next_item["last_refresh_error_at"] = self._now()
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[access_token] = account
+                self._save_accounts()
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
@@ -1612,12 +1693,15 @@ class AccountService:
             next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
-                next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if next_item["quota"] == 0:
-                    next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
-                elif next_item.get("status") == "限流":
-                    next_item["status"] = "正常"
+                # 额度未知时不能本地递减：0 会被误判成耗尽，把刚成功出图的号封成限流。
+                # 等下一次探测拿到真实读数后再恢复按次扣减。
+                if self._quota_known(next_item):
+                    next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+                    if next_item["quota"] == 0:
+                        next_item["status"] = "限流"
+                        next_item["restore_at"] = next_item.get("restore_at") or None
+                    elif next_item.get("status") == "限流":
+                        next_item["status"] = "正常"
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)
@@ -1839,6 +1923,7 @@ class AccountService:
                     raise
                 except Exception as exc:
                     error_str = str(exc)
+                    self._record_refresh_failure(token, error_str)
                     # TLS/代理连接错误是网络问题，不计入账号失败
                     from services.protocol.conversation import is_tls_connection_error
                     if not is_tls_connection_error(error_str):

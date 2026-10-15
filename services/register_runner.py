@@ -60,6 +60,10 @@ def _is_valid(account: dict, min_quota: int, source_type: str) -> bool:
         return False
     if source_type and str(account.get("source_type") or "web").lower() != source_type.lower():
         return False
+    if not account_service._quota_known(account):
+        # 额度未知的账号按「有效」计：它只是还没探测成功，
+        # 当成 0 额度会把水位守护逼进反复补注册的循环。
+        return True
     return int(account.get("quota") or 0) >= max(0, min_quota)
 
 
@@ -67,7 +71,7 @@ def _valid_snapshot(min_quota: int, source_type: str) -> tuple[int, int, int]:
     """返回 (有效账号数, 有效额度总和, 观测到的单号平均额度)。"""
     accounts = account_service.list_accounts()
     valid = [a for a in accounts if _is_valid(a, min_quota, source_type)]
-    quotas = [int(a.get("quota") or 0) for a in valid]
+    quotas = [int(a.get("quota") or 0) for a in valid if account_service._quota_known(a)]
     quotas = [q for q in quotas if q > 0]
     avg = max(1, round(sum(quotas) / len(quotas))) if quotas else 0
     return len(valid), sum(quotas), avg
@@ -176,6 +180,9 @@ class PoolKeeper:
 
         valid_count, valid_quota, observed_avg = _valid_snapshot(s["keeper_min_quota"], s["keeper_source_type"])
         inflight = register_manager.inflight_count()
+        # 额度未知的账号不计入 valid_quota，但按单号估算额度补回总盘，
+        # 否则会把总量低估成 0 而反复补注册。
+        unknown_quota = account_service.unknown_quota_count()
 
         # 单号额度估算：优先用池内观测均值，池空时用配置的兜底值。
         est_quota = observed_avg or max(1, int(s["keeper_estimate_quota"]))
@@ -185,7 +192,7 @@ class PoolKeeper:
 
         gap_accounts = max(0, target_accounts - (valid_count + inflight)) if target_accounts > 0 else 0
         if target_quota > 0:
-            projected = valid_quota + inflight * est_quota
+            projected = valid_quota + (unknown_quota + inflight) * est_quota
             missing = max(0, target_quota - projected)
             gap_quota = -(-missing // est_quota)  # 向上取整
         else:
