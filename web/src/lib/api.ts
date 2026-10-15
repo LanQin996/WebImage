@@ -1369,6 +1369,21 @@ export async function deleteProxyPoolEntry(proxyId: string) {
   });
 }
 
+export type ProxyPoolBatchAction = "enable" | "disable" | "test" | "delete";
+
+export async function batchProxyPoolEntries(ids: string[], action: ProxyPoolBatchAction) {
+  return httpRequest<
+    ProxyPoolPayload & {
+      affected: number;
+      reassigned?: number;
+      results?: Array<{ id: string; result: ProxyPoolTestResult }>;
+    }
+  >("/api/proxy/pool/batch", {
+    method: "POST",
+    body: { ids, action },
+  });
+}
+
 export async function testProxyPoolEntry(proxyId: string) {
   return httpRequest<ProxyPoolPayload & { result: ProxyPoolTestResult }>(
     `/api/proxy/pool/${encodeURIComponent(proxyId)}/test`,

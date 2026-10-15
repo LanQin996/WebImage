@@ -6,6 +6,7 @@ import { ArrowDownLeft, ArrowUpRight, LoaderCircle, Network, Pencil, PlugZap, Pl
 import { Tooltip } from "@/components/motion/tooltip";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Switch } from "@/components/ui/switch";
 import type { ProxyPoolItem } from "@/lib/api";
@@ -17,6 +18,10 @@ type ProxyPoolTableProps = {
   isLoading: boolean;
   pendingIds: Set<string>;
   testingIds: Set<string>;
+  selectedIds: Set<string>;
+  selectionDisabled: boolean;
+  onSelect: (id: string, selected: boolean) => void;
+  onSelectAll: (selected: boolean) => void;
   onToggle: (item: ProxyPoolItem, enabled: boolean) => void;
   onTest: (item: ProxyPoolItem) => void;
   onEdit: (item: ProxyPoolItem) => void;
@@ -167,6 +172,10 @@ export function ProxyPoolTable({
   isLoading,
   pendingIds,
   testingIds,
+  selectedIds,
+  selectionDisabled,
+  onSelect,
+  onSelectAll,
   onToggle,
   onTest,
   onEdit,
@@ -174,6 +183,8 @@ export function ProxyPoolTable({
   onAdd,
 }: ProxyPoolTableProps) {
   const duplicateIps = useMemo(() => duplicateExitIps(items), [items]);
+  const allSelected = items.length > 0 && items.every((item) => selectedIds.has(item.id));
+  const someSelected = items.some((item) => selectedIds.has(item.id));
 
   if (items.length === 0) {
     return isLoading ? (
@@ -195,10 +206,18 @@ export function ProxyPoolTable({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[1080px] text-left text-[13px] tabular-nums">
+      <table className="w-full min-w-[1120px] text-left text-[13px] tabular-nums">
         <thead className="text-xs text-muted-foreground">
           <tr className="border-b border-border [&>th]:h-8 [&>th]:px-2.5 [&>th]:font-medium [&>th]:whitespace-nowrap">
-            <th className="!pl-3.5">名称</th>
+            <th className="w-10 !pr-0 !pl-3.5">
+              <Checkbox
+                aria-label="全选代理"
+                checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                onCheckedChange={onSelectAll}
+                disabled={selectionDisabled}
+              />
+            </th>
+            <th>名称</th>
             <th>地址</th>
             <th>启用</th>
             <th>健康</th>
@@ -216,16 +235,26 @@ export function ProxyPoolTable({
             const latency = formatLatency(item.health?.latency_ms);
             const displayName = item.name?.trim();
             const rowLabel = displayName || item.masked_url;
+            const selected = selectedIds.has(item.id);
 
             return (
               <tr
                 key={item.id}
+                data-selected={selected || undefined}
                 className={cn(
-                  "group border-b border-border/70 text-foreground/80 transition-colors last:border-b-0 hover:bg-accent/60 [&>td]:h-10 [&>td]:px-2.5 [&>td]:whitespace-nowrap",
+                  "group border-b border-border/70 text-foreground/80 transition-colors last:border-b-0 hover:bg-accent/60 data-[selected]:bg-primary/[0.06] [&>td]:h-10 [&>td]:px-2.5 [&>td]:whitespace-nowrap",
                   !item.enabled && "text-muted-foreground",
                 )}
               >
-                <td className="!pl-3.5">
+                <td className="!pr-0 !pl-3.5">
+                  <Checkbox
+                    aria-label={`选择 ${rowLabel}`}
+                    checked={selected}
+                    onCheckedChange={(checked) => onSelect(item.id, checked)}
+                    disabled={selectionDisabled}
+                  />
+                </td>
+                <td>
                   <div className="flex max-w-[320px] items-center gap-1.5">
                     <span
                       className={cn("min-w-0 truncate", displayName ? "text-foreground" : "text-muted-foreground")}
@@ -246,7 +275,7 @@ export function ProxyPoolTable({
                     <Switch
                       checked={item.enabled}
                       onCheckedChange={(next) => onToggle(item, next)}
-                      disabled={isPending}
+                      disabled={isPending || selectionDisabled}
                       aria-label={`${item.enabled ? "禁用" : "启用"} ${rowLabel}`}
                     />
                     {item.missing ? <HintBadge label="节点不可用" hint={MISSING_HINT} variant="warning" /> : null}
@@ -289,7 +318,7 @@ export function ProxyPoolTable({
                       aria-label={`测试 ${rowLabel}`}
                       title="立即测试并更新健康状态"
                       onClick={() => onTest(item)}
-                      disabled={isTesting}
+                      disabled={isTesting || selectionDisabled}
                     >
                       {isTesting ? <LoaderCircle className="size-3.5 animate-spin" /> : <PlugZap className="size-3.5" />}
                     </Button>
@@ -300,7 +329,7 @@ export function ProxyPoolTable({
                       aria-label={`编辑 ${rowLabel}`}
                       title="编辑"
                       onClick={() => onEdit(item)}
-                      disabled={isPending}
+                      disabled={isPending || selectionDisabled}
                     >
                       <Pencil className="size-3.5" />
                     </Button>
@@ -311,7 +340,7 @@ export function ProxyPoolTable({
                       aria-label={`删除 ${rowLabel}`}
                       title="删除"
                       onClick={() => onDelete(item)}
-                      disabled={isPending}
+                      disabled={isPending || selectionDisabled}
                     >
                       <Trash2 className="size-3.5" />
                     </Button>

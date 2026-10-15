@@ -7,7 +7,7 @@ from unittest import mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import api.proxy_pool as proxy_pool_api
@@ -125,6 +125,57 @@ class ProxyPoolApiTests(unittest.TestCase):
         response = self.client.post(f"/api/proxy/pool/{a}", headers=AUTH_HEADERS, json={"url": "http://b.example:1"})
         self.assertEqual(response.status_code, 400)
         self.assertIn("已存在", response.json()["detail"]["error"])
+
+    def test_batch_enable_disable_and_probe(self) -> None:
+        self.post("/api/proxy/pool", {"urls": ["http://a.example:1", "http://b.example:1"]})
+        ids = [entry["id"] for entry in self.pool.list_entries()]
+
+        disabled = self.post("/api/proxy/pool/batch", {"ids": [ids[0], ids[1], ids[0]], "action": "disable"})
+        self.assertEqual(disabled["affected"], 2)
+        self.assertEqual(disabled["summary"]["enabled"], 0)
+
+        enabled = self.post("/api/proxy/pool/batch", {"ids": ids, "action": "enable"})
+        self.assertEqual(enabled["summary"]["enabled"], 2)
+
+        tested = self.post("/api/proxy/pool/batch", {"ids": ids, "action": "test"})
+        self.assertEqual([item["id"] for item in tested["results"]], ids)
+        self.assertEqual(len(self.probes), 2)
+        self.assertTrue(all(item["result"]["ok"] for item in tested["results"]))
+
+    def test_batch_delete_reassigns_only_to_surviving_proxies(self) -> None:
+        self.accounts.update_account("t1", {"proxy": ""})
+        self.post("/api/proxy/pool", {"urls": ["http://a.example:1", "http://b.example:1", "http://c.example:1"]})
+        a, b, c = [entry["id"] for entry in self.pool.list_entries()]
+        self.post("/api/proxy/pool/settings", {"enabled": True})
+        self.accounts.update_account("t1", {"proxy_id": a})
+        self.accounts.update_account("t2", {"proxy_id": b})
+        self.accounts.update_account("t3", {"proxy_id": c})
+
+        deleted = self.post("/api/proxy/pool/batch", {"ids": [a, b], "action": "delete"})
+        self.assertEqual((deleted["affected"], deleted["reassigned"]), (2, 2))
+        self.assertEqual([entry["id"] for entry in self.pool.list_entries()], [c])
+        self.assertEqual(self.bindings()["t1"], c)
+        self.assertEqual(self.bindings()["t2"], c)
+
+        self.post("/api/proxy/pool/batch", {"ids": [c], "action": "delete"})
+        self.assertTrue(all(binding == "" for binding in self.bindings().values()))
+
+    def test_batch_rejects_missing_entry_before_any_change(self) -> None:
+        self.post("/api/proxy/pool", {"urls": ["http://a.example:1"]})
+        proxy_id = self.pool.list_entries()[0]["id"]
+        response = self.client.post("/api/proxy/pool/batch", headers=AUTH_HEADERS,
+                                    json={"ids": [proxy_id, "px_missing"], "action": "delete"})
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(self.pool.has_entry(proxy_id))
+        response = self.client.post("/api/proxy/pool/batch", headers=AUTH_HEADERS,
+                                    json={"ids": [], "action": "disable"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_batch_requires_admin(self) -> None:
+        with mock.patch.object(proxy_pool_api, "require_admin", side_effect=HTTPException(status_code=403)):
+            response = self.client.post("/api/proxy/pool/batch", headers=AUTH_HEADERS,
+                                        json={"ids": ["px_missing"], "action": "delete"})
+        self.assertEqual(response.status_code, 403)
 
     def test_subscription_flow(self) -> None:
         self.accounts.update_account("t1", {"proxy": ""})   # 池里只有订阅节点

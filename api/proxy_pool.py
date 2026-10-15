@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
+
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
@@ -27,6 +30,11 @@ class ProxyPoolUpdateRequest(BaseModel):
     name: str | None = None
     url: str | None = None
     enabled: bool | None = None
+
+
+class ProxyPoolBatchRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=500)
+    action: Literal["enable", "disable", "test", "delete"]
 
 
 class SubscriptionCreateRequest(BaseModel):
@@ -163,6 +171,42 @@ def create_router() -> APIRouter:
                 "assigned": assigned,
                 "core_apply": core_apply,
             }
+
+        return await run_in_threadpool(apply)
+
+    @router.post("/api/proxy/pool/batch")
+    async def batch_proxy_pool_entries(body: ProxyPoolBatchRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+
+        def apply() -> dict:
+            ids = list(dict.fromkeys(body.ids))
+            entries = [proxy_pool.get_entry(proxy_id) for proxy_id in ids]
+            if any(entry is None for entry in entries):
+                raise HTTPException(status_code=404, detail={"error": "选中的代理不存在，请刷新后重试"})
+
+            if body.action == "test":
+                with ThreadPoolExecutor(max_workers=min(8, len(ids))) as executor:
+                    results = list(executor.map(proxy_pool.probe, ids))
+                return {
+                    **build_pool_payload(),
+                    "affected": len(ids),
+                    "results": [{"id": proxy_id, "result": result} for proxy_id, result in zip(ids, results)],
+                }
+
+            if body.action in {"enable", "disable"}:
+                enabled = body.action == "enable"
+                for proxy_id in ids:
+                    proxy_pool.update_entry(proxy_id, {"enabled": enabled})
+                account_service.bind_unbound_accounts()
+                return {**build_pool_payload(), "affected": len(ids)}
+
+            # 先移除全部目标，再改绑；不能把账号临时改绑到另一条待删除代理。
+            for proxy_id in ids:
+                proxy_pool.delete_entry(proxy_id)
+            reassigned = sum(account_service.reassign_proxy_bindings(proxy_id) for proxy_id in ids)
+            for entry in entries:
+                proxy_subscriptions.on_proxy_deleted(entry)
+            return {**build_pool_payload(), "affected": len(ids), "reassigned": reassigned}
 
         return await run_in_threadpool(apply)
 

@@ -54,6 +54,50 @@ export function ProxyDeleteDialog({ item, hasOtherProxies, isDeleting, onCancel,
   );
 }
 
+type ProxyBulkDeleteDialogProps = {
+  count: number;
+  boundCount: number;
+  remainingCount: number;
+  subscriptionCount: number;
+  isDeleting: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+};
+
+export function ProxyBulkDeleteDialog({
+  count, boundCount, remainingCount, subscriptionCount, isDeleting, onCancel, onConfirm,
+}: ProxyBulkDeleteDialogProps) {
+  return (
+    <Dialog open={count > 0} onOpenChange={(open) => (!open && !isDeleting ? onCancel() : null)}>
+      <DialogContent showCloseButton={false} className="max-w-md">
+        <DialogHeader className="gap-2">
+          <DialogTitle>删除选中的代理</DialogTitle>
+          <DialogDescription asChild>
+            <div className="space-y-2 text-sm leading-6">
+              <p>确认删除选中的 {count} 个代理吗？</p>
+              {boundCount > 0 ? (
+                <p>
+                  {remainingCount > 0
+                    ? `${boundCount} 个已绑定账号会改绑到未删除的代理；若没有可用代理，账号会暂时解除绑定。`
+                    : `${boundCount} 个已绑定账号会解除绑定，直到代理池重新有可用代理。`}
+                </p>
+              ) : null}
+              {subscriptionCount > 0 ? <p>其中 {subscriptionCount} 个订阅代理之后可从订阅中重新导入。</p> : null}
+            </div>
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="secondary" onClick={onCancel} disabled={isDeleting}>取消</Button>
+          <Button variant="destructive" onClick={onConfirm} disabled={isDeleting}>
+            {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+            删除 {count} 个
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 type ProxySubscriptionDeleteDialogProps = {
   item: ProxySubscriptionSummary | null;
   isDeleting: boolean;

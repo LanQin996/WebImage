@@ -30,7 +30,8 @@ def save_account(payload: dict) -> dict:
 
     注意 type 不能写死 codex：account_service._prepare_account_payload 见到
     type=codex 会把它改写成 source_type=codex（那是 CPA 导出格式的语义），
-    platform 链路拿到的 web token 会被错误归类。
+    platform 链路拿到的 web token 会被错误归类。注册出口仅用于注册过程，
+    落池时不传代理，由现有账号代理池为新账号分配绑定。
     """
     source_type = str(payload.get("source_type") or "web").strip().lower() or "web"
     item: dict = {
@@ -41,7 +42,6 @@ def save_account(payload: dict) -> dict:
         "email": payload.get("email", ""),
         "source_type": source_type,
         "plan_type": payload.get("plan_type", ""),
-        "proxy": payload.get("proxy", ""),
     }
     # 保存注册密码：供后续自动重登（auto_relogin_after_refresh）使用。
     if payload.get("registration_password"):

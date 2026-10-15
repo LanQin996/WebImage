@@ -12,6 +12,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.proxy_pool_service import ProxyPoolService
+from services import register_runner
 
 
 class MemoryStorage:
@@ -182,6 +183,25 @@ class MigrationTests(_HermeticCase):
 
 
 class ImportTests(_HermeticCase):
+    def test_registered_account_uses_pool_assignment_not_registration_proxy(self) -> None:
+        pool = make_pool("http://a.example:1", "http://b.example:1")
+        a, b = [entry["id"] for entry in pool.list_entries()]
+        service, storage = make_service(pool, [{"access_token": "existing", "proxy_id": a}])
+
+        with patch.object(register_runner, "account_service", service), \
+                patch.object(service, "refresh_accounts") as refresh:
+            result = register_runner.save_account({
+                "access_token": "registered",
+                "source_type": "web",
+                "proxy": "http://registration.example:8080",
+            })
+
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(stored(storage, "registered")["proxy_id"], b)
+        self.assertEqual(stored(storage, "registered")["proxy"], "")
+        self.assertEqual(len(pool.list_entries()), 2)
+        refresh.assert_called_once_with(["registered"])
+
     def test_import_converts_proxy_and_drops_foreign_id(self) -> None:
         pool = make_pool("http://a.example:1")
         service, storage = make_service(pool)

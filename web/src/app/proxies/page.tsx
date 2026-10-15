@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Plus, RefreshCw } from "lucide-react";
+import { LoaderCircle, Plus, Power, PowerOff, RefreshCw, Trash2, PlugZap, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { PageEnter } from "@/components/page-enter";
@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  batchProxyPoolEntries,
   deleteProxyPoolEntry,
   fetchProxyPool,
   fetchProxySubscriptions,
@@ -20,6 +21,7 @@ import {
   type ProxyPoolItem,
   type ProxyPoolPayload,
   type ProxyPoolSettings,
+  type ProxyPoolBatchAction,
   type ProxySubscriptionsPayload,
 } from "@/lib/api";
 import { pickProxyPoolPayload, proxyPoolLabel } from "@/lib/proxy-pool";
@@ -27,7 +29,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
 import { ProxyAddDialog } from "./components/proxy-add-dialog";
-import { ProxyDeleteDialog, ProxyPoolToggleDialog } from "./components/proxy-confirm-dialogs";
+import { ProxyBulkDeleteDialog, ProxyDeleteDialog, ProxyPoolToggleDialog } from "./components/proxy-confirm-dialogs";
 import { ProxyEditDialog } from "./components/proxy-edit-dialog";
 import { ProxyPoolOverviewCard } from "./components/proxy-pool-overview-card";
 import { ProxyPoolTable } from "./components/proxy-pool-table";
@@ -63,6 +65,9 @@ function ProxiesPageContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
   const [testingIds, setTestingIds] = useState<Set<string>>(() => new Set());
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [bulkAction, setBulkAction] = useState<ProxyPoolBatchAction | null>(null);
+  const [bulkDeleteIds, setBulkDeleteIds] = useState<string[] | null>(null);
   // 每次拉取或写操作都会递增；轮询结果回来时如果已经有更新的数据，就丢弃这次结果
   const versionRef = useRef(0);
   const [tab, setTab] = useState("pool");
@@ -74,6 +79,12 @@ function ProxiesPageContent() {
   const applyPayload = useCallback((data: ProxyPoolPayload) => {
     versionRef.current += 1;
     setPool(pickProxyPoolPayload(data));
+    const validIds = new Set(data.items.map((item) => item.id));
+    setSelectedIds((current) => new Set([...current].filter((id) => validIds.has(id))));
+    setBulkDeleteIds((current) => {
+      const remaining = current?.filter((id) => validIds.has(id));
+      return remaining?.length ? remaining : null;
+    });
     setLoadError("");
   }, []);
 
@@ -87,8 +98,7 @@ function ProxiesPageContent() {
       if (version !== versionRef.current) {
         return;
       }
-      setPool(pickProxyPoolPayload(data));
-      setLoadError("");
+      applyPayload(data);
     } catch (error) {
       if (version !== versionRef.current) {
         return;
@@ -103,7 +113,7 @@ function ProxiesPageContent() {
         setIsLoading(false);
       }
     }
-  }, []);
+  }, [applyPayload]);
 
   // 订阅列表的错误不弹 toast（例如后端还没有这个接口），只在订阅页里显示
   const loadSubscriptions = useCallback(async () => {
@@ -181,6 +191,48 @@ function ProxiesPageContent() {
   const settings = pool?.settings ?? null;
   const items = pool?.items ?? [];
   const poolEnabled = Boolean(settings?.enabled);
+  const selectedItems = items.filter((item) => selectedIds.has(item.id));
+  const bulkDeleteItems = items.filter((item) => bulkDeleteIds?.includes(item.id));
+  const bulkBusy = bulkAction !== null;
+  const bulkUnavailable = bulkBusy || pendingIds.size > 0 || testingIds.size > 0 || isDeleting;
+
+  const handleSelect = (id: string, selected: boolean) => {
+    setSelectedIds((current) => addToSet(current, id, selected));
+  };
+
+  const handleSelectAll = (selected: boolean) => {
+    setSelectedIds(selected ? new Set(items.map((item) => item.id)) : new Set());
+  };
+
+  const handleBulkAction = async (action: ProxyPoolBatchAction, ids: string[]) => {
+    if (ids.length === 0 || bulkUnavailable) return;
+    setBulkAction(action);
+    try {
+      const data = await batchProxyPoolEntries(ids, action);
+      applyPayload(data);
+      if (action === "test") {
+        const available = data.results?.filter((entry) => entry.result.ok).length ?? 0;
+        toast[available === ids.length ? "success" : "warning"](`检测完成：${available}/${ids.length} 个代理可用`);
+      } else if (action === "delete") {
+        setSelectedIds(new Set());
+        setBulkDeleteIds(null);
+        const bindingMessage = data.reassigned
+          ? items.length === ids.length
+            ? `，解除 ${data.reassigned} 个账号的绑定`
+            : `，处理 ${data.reassigned} 个账号的绑定`
+          : "";
+        toast.success(`已删除 ${data.affected} 个代理${bindingMessage}`);
+        if (bulkDeleteItems.some((item) => item.subscription_id)) void loadSubscriptions();
+      } else {
+        setSelectedIds(new Set());
+        toast.success(`已${action === "enable" ? "启用" : "禁用"} ${data.affected} 个代理`);
+      }
+    } catch (error) {
+      toast.error(errorMessage(error, "批量操作失败"));
+    } finally {
+      setBulkAction(null);
+    }
+  };
 
   const handleToggleConfirm = async (next: boolean) => {
     setIsTogglingPool(true);
@@ -363,6 +415,10 @@ function ProxiesPageContent() {
                   isLoading={isLoading && !pool}
                   pendingIds={pendingIds}
                   testingIds={testingIds}
+                  selectedIds={selectedIds}
+                  selectionDisabled={bulkBusy}
+                  onSelect={handleSelect}
+                  onSelectAll={handleSelectAll}
                   onToggle={(item, enabled) => void handleToggleItem(item, enabled)}
                   onTest={(item) => void handleTestItem(item)}
                   onEdit={setEditingItem}
@@ -375,6 +431,30 @@ function ProxiesPageContent() {
               ) : null}
             </CardContent>
           </Card>
+          {selectedItems.length > 0 ? (
+            <div role="toolbar" aria-label="代理批量操作" className="sticky bottom-3 z-20 mt-3 flex max-w-full flex-wrap items-center gap-1.5 rounded-md border border-border bg-background p-2 shadow-lg">
+              <span className="px-2 text-xs tabular-nums text-muted-foreground">已选 {selectedItems.length} 项</span>
+              <Button variant="outline" size="sm" disabled={bulkUnavailable || selectedItems.every((item) => item.enabled)} onClick={() => void handleBulkAction("enable", selectedItems.map((item) => item.id))}>
+                {bulkAction === "enable" ? <LoaderCircle className="size-4 animate-spin" /> : <Power className="size-4" />}
+                启用
+              </Button>
+              <Button variant="outline" size="sm" disabled={bulkUnavailable || selectedItems.every((item) => !item.enabled)} onClick={() => void handleBulkAction("disable", selectedItems.map((item) => item.id))}>
+                {bulkAction === "disable" ? <LoaderCircle className="size-4 animate-spin" /> : <PowerOff className="size-4" />}
+                禁用
+              </Button>
+              <Button variant="outline" size="sm" disabled={bulkUnavailable} onClick={() => void handleBulkAction("test", selectedItems.map((item) => item.id))}>
+                {bulkAction === "test" ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                检测
+              </Button>
+              <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" disabled={bulkUnavailable} onClick={() => setBulkDeleteIds(selectedItems.map((item) => item.id))}>
+                <Trash2 className="size-4" />
+                删除
+              </Button>
+              <Button variant="ghost" size="icon-sm" aria-label="取消选择" title="取消选择" disabled={bulkBusy} onClick={() => setSelectedIds(new Set())}>
+                <X className="size-4" />
+              </Button>
+            </div>
+          ) : null}
         </TabsContent>
 
         <TabsContent value="subscriptions">
@@ -413,6 +493,15 @@ function ProxiesPageContent() {
         isDeleting={isDeleting}
         onCancel={() => setDeletingItem(null)}
         onConfirm={() => void handleDelete()}
+      />
+      <ProxyBulkDeleteDialog
+        count={bulkDeleteItems.length}
+        boundCount={bulkDeleteItems.reduce((total, item) => total + item.bound_count, 0)}
+        remainingCount={items.length - bulkDeleteItems.length}
+        subscriptionCount={bulkDeleteItems.filter((item) => item.subscription_id).length}
+        isDeleting={bulkAction === "delete"}
+        onCancel={() => setBulkDeleteIds(null)}
+        onConfirm={() => void handleBulkAction("delete", bulkDeleteItems.map((item) => item.id))}
       />
     </PageEnter>
   );
