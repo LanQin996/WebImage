@@ -27,7 +27,14 @@ from services.account_service import account_service
 from services.config import config
 from services.image_runtime_repository import account_health_key
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    DEFAULT_WEB_IMAGE_MODELS,
+    UpstreamHTTPError,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from services.sentinel_solver_service import sentinel_solver_service
@@ -228,6 +235,8 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        # 本 Session 是否已经真访问过首页：Cloudflare 边缘 Cookie 只能由首页响应下发
+        self._bootstrapped = False
         self.progress_callback: Callable[[str], None] | None = None
         # 出口每个实例只解析一次：代理池轮询/借用时，主 session、Codex、bootstrap 缓存和 solver 必须同一出口
         self.proxy_profile = proxy_settings.get_profile(account=self.account, upstream=True)
@@ -240,7 +249,7 @@ class OpenAIBackendAPI:
         ))
         proxy_settings.track_session(self.session, self.proxy_profile)
         self.session.headers.update({
-            "User-Agent": self.user_agent,
+            "User-Agent": self._sentinel_handshake_ua(),
             "Origin": self.base_url,
             "Referer": self.base_url + "/",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
@@ -428,10 +437,19 @@ class OpenAIBackendAPI:
         })
         return result
 
+    def _sentinel_handshake_ua(self) -> str:
+        """本次 Sentinel 握手（PoW / requirements / 请求头 / solver 浏览器环境）统一使用的 UA。
+
+        上游对网页生图按握手质量打分：TLS 指纹、请求头、PoW 脚本执行和 solver 里跑
+        Turnstile 的浏览器必须是同一个身份，任何一处不一致都会被判为可疑，直接回
+        `404 {"detail": "Model not found"}` 这种伪装错误而不是 403。
+        """
+        return str(getattr(self, "user_agent", "") or FINGERPRINT_UA)
+
     def _bootstrap_headers(self) -> Dict[str, str]:
         """构造首页预热请求头。"""
         return {
-            "User-Agent": self.user_agent,
+            "User-Agent": self._sentinel_handshake_ua(),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Sec-Ch-Ua": self.session.headers["Sec-Ch-Ua"],
@@ -455,7 +473,7 @@ class OpenAIBackendAPI:
             proof_token = build_proof_token(
                 proof_info.get("seed", ""),
                 proof_info.get("difficulty", ""),
-                self.user_agent,
+                self._sentinel_handshake_ua(),
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
             )
@@ -611,18 +629,47 @@ class OpenAIBackendAPI:
             payload["thinking_effort"] = normalized_effort
         return payload
 
+    @staticmethod
+    def _is_web_image_upstream_model(value: str) -> bool:
+        """判断上游模型名是否是网页生图接口能接受的 slug（`auto` 或官网真实型号）。
+
+        思考强度后缀（`-standard` / `-extended` / `-max`）属于项目内的约定写法，先剥掉再判断。
+        """
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return False
+        for suffix in ("standard", "extended", "max"):
+            marker = f"-{suffix}"
+            if normalized.endswith(marker):
+                normalized = normalized[: -len(marker)]
+                break
+        if normalized == "auto" or normalized in DEFAULT_WEB_IMAGE_MODELS:
+            return True
+        _, base_model = split_image_model(normalized)
+        return bool(base_model)
+
     def _image_model_settings(self, model: str) -> tuple[str, str]:
         """把标准图片模型名映射为上游模型及思考强度。
 
         `gpt-image-2` 仍按配置映射到 `default_upstream_model_name`；其余 Web 生图模型
         （如 `gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`）为上游官网模型目录里的
         真实 slug，原样透传，避免被映射成 `auto`。
+        该配置被写成文本模型名（如 `gpt-5-5`、`gpt-6`）时，图片接口不会回 400/403，
+        而是统一回 `404 {"detail": "Model not found"}`；这种配置一律兜底成 `auto`。
         """
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto", ""
         if base_model == "gpt-image-2":
             upstream_model = config.default_upstream_model_name
+            if not self._is_web_image_upstream_model(upstream_model):
+                logger.warning({
+                    "event": "image_model_mapping_fallback",
+                    "requested_model": model,
+                    "ignored_upstream_model": upstream_model,
+                    "fallback_model": "auto",
+                })
+                return "auto", ""
         elif base_model == CODEX_IMAGE_MODEL:
             upstream_model = base_model
         else:
@@ -2864,20 +2911,33 @@ class OpenAIBackendAPI:
         return profile
 
     def _bootstrap(self) -> None:
-        """预热首页，并提取 PoW 相关脚本引用（按代理出口缓存 5 分钟）。"""
+        """预热首页，并提取 PoW 相关脚本引用（PoW 结果按代理出口缓存 5 分钟）。
+
+        PoW 脚本可以共享缓存，但 Cloudflare 的边缘 Cookie 是按连接下发的：新实例的
+        Session 若因为缓存命中而跳过首页，后面的 `sentinel/chat-requirements/prepare`
+        会偶发 403 挑战页（进而被判为握手不合格，回伪装 404）。因此每个实例的
+        Session 至少真访问一次首页，缓存只用来省掉重复解析。
+        """
         try:
             egress = str(self._egress_profile().proxy_url or "direct")
         except Exception:
             egress = "direct"
         now = time.time()
+        entry = None
         with _BOOTSTRAP_CACHE_LOCK:
-            entry = _BOOTSTRAP_CACHE.get(egress)
-            if entry and now - entry[0] < _BOOTSTRAP_CACHE_TTL_SECS:
-                self.pow_script_sources = list(entry[1])
-                self.pow_data_build = entry[2]
+            cached = _BOOTSTRAP_CACHE.get(egress)
+            if cached and now - cached[0] < _BOOTSTRAP_CACHE_TTL_SECS:
+                entry = cached
+        if entry is not None:
+            self.pow_script_sources = list(entry[1])
+            self.pow_data_build = entry[2]
+            if getattr(self, "_bootstrapped", False):
                 return
         response = self._fetch("get", self.base_url + "/", headers=self._bootstrap_headers(), timeout=30)
         ensure_ok(response, "bootstrap")
+        self._bootstrapped = True
+        if entry is not None:
+            return
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
@@ -2894,14 +2954,20 @@ class OpenAIBackendAPI:
         turnstile_info = requirements_payload.get("turnstile") or {}
         if not (turnstile_info.get("required") and turnstile_info.get("dx")):
             return ""
-        # 池出口时让 solver 走同一个代理，turnstile 求解与业务请求同一 IP
+        # solver 必须与业务请求同源：账号代理、池代理、稳定代理、全局代理都透传，
+        # 否则 turnstile 在一个 IP 上求解、业务请求从另一个 IP 发出，上游会按伪装 404 拒掉
         try:
             profile = self._egress_profile()
-            solver_proxy = profile.proxy_url if profile.proxy_id else ""
+            solver_proxy = str(profile.proxy_url or "")
         except Exception:
             solver_proxy = ""
         try:
-            token = sentinel_solver_service.solve_turnstile(requirements_payload, source_p, proxy=solver_proxy)
+            token = sentinel_solver_service.solve_turnstile(
+                requirements_payload,
+                source_p,
+                proxy=solver_proxy,
+                user_agent=self._sentinel_handshake_ua(),
+            )
         except Exception as exc:
             logger.warning({"event": "sentinel_solver_exception", "error": str(exc)[:200]})
             token = None
@@ -2912,7 +2978,8 @@ class OpenAIBackendAPI:
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
-        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+        handshake_ua = self._sentinel_handshake_ua()
+        p_token = build_legacy_requirements_token(handshake_ua, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
         response = self._fetch("post", self.base_url + prepare_path,
@@ -2930,7 +2997,7 @@ class OpenAIBackendAPI:
             proof_token = build_proof_token(
                 proof_info.get("seed", ""),
                 proof_info.get("difficulty", ""),
-                self.user_agent,
+                handshake_ua,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
             )

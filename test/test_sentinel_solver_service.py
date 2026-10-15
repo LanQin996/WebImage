@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,24 @@ def make_service(**overrides: object) -> SentinelSolverService:
     service = SentinelSolverService()
     service.settings = lambda: dict(settings)      # type: ignore[method-assign]
     return service
+
+
+SYSTEM_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+
+class FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
 
 
 class SentinelSolverSettingsTests(unittest.TestCase):
@@ -123,6 +142,168 @@ class SentinelSolverServiceTests(unittest.TestCase):
         service = make_service(enabled=True, url="http://127.0.0.1:8788", key="")
 
         self.assertNotIn("X-Solver-Key", service._headers(service.settings()))
+
+
+class SentinelSolverUserAgentTests(unittest.TestCase):
+    """求解页面的 UA 必须跟着主服务请求指纹走，否则 Sentinel 握手会因指纹不一致被拒（伪装 404）。"""
+
+    def _patch_health(self, reply: dict | Exception) -> tuple[list[dict], object]:
+        calls: list[dict] = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append({"url": request.full_url, "timeout": timeout})
+            if isinstance(reply, Exception):
+                raise reply
+            return FakeResponse(reply)
+
+        return calls, patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen)
+
+    def test_user_agent_reads_health_and_caches_success(self) -> None:
+        calls, patcher = self._patch_health({"ok": True, "user_agent": SYSTEM_UA})
+        service = make_service(enabled=True, url="http://127.0.0.1:8788")
+
+        with patcher, patch("services.sentinel_solver_service.time.monotonic") as clock:
+            clock.return_value = 1_000.0
+            self.assertEqual(service.user_agent(), SYSTEM_UA)
+            clock.return_value = 1_599.0
+            self.assertEqual(service.user_agent(), SYSTEM_UA)          # 命中缓存，不再请求 /health
+            clock.return_value = 1_601.0
+            self.assertEqual(service.user_agent(), SYSTEM_UA)          # 超过 600s 后重新查询
+
+        self.assertEqual([call["url"] for call in calls], ["http://127.0.0.1:8788/health"] * 2)
+
+    def test_user_agent_caches_failure_for_a_shorter_time(self) -> None:
+        calls, patcher = self._patch_health({"ok": False, "error": "browser not reachable"})
+        service = make_service(enabled=True, url="http://127.0.0.1:8788")
+
+        with patcher, patch("services.sentinel_solver_service.logger") as logger, \
+                patch("services.sentinel_solver_service.time.monotonic") as clock:
+            clock.return_value = 2_000.0
+            self.assertEqual(service.user_agent(), "")
+            clock.return_value = 2_029.0
+            self.assertEqual(service.user_agent(), "")                 # 30s 内的失败结果直接用缓存
+            clock.return_value = 2_031.0
+            self.assertEqual(service.user_agent(), "")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call.args[0]["event"] for call in logger.warning.call_args_list],
+                         ["sentinel_solver_user_agent_unavailable", "sentinel_solver_user_agent_unavailable"])
+
+    def test_user_agent_is_empty_without_calling_health_when_disabled(self) -> None:
+        for service in (make_service(enabled=False, url="http://127.0.0.1:8788"),
+                        make_service(enabled=True, url=""),
+                        make_service()):
+            with self.subTest(settings=service.settings()):
+                with patch("services.sentinel_solver_service.urllib.request.urlopen",
+                           side_effect=AssertionError("不该发起请求")):
+                    self.assertEqual(service.user_agent(), "")
+
+    def test_user_agent_cache_is_keyed_by_url(self) -> None:
+        settings = dict(DEFAULT_SENTINEL_SOLVER, enabled=True, url="http://a:8788")
+        service = SentinelSolverService()
+        service.settings = lambda: dict(settings)                      # type: ignore[method-assign]
+        seen: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            return FakeResponse({"ok": True, "user_agent": f"ua-of-{request.full_url.split('//')[1].split('/')[0]}"})
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen), \
+                patch("services.sentinel_solver_service.time.monotonic", return_value=10.0):
+            self.assertEqual(service.user_agent(), "ua-of-a:8788")
+            settings["url"] = "http://b:8788"                          # 换求解器后必须重新读 UA
+            self.assertEqual(service.user_agent(), "ua-of-b:8788")
+
+        self.assertEqual(seen, ["http://a:8788/health", "http://b:8788/health"])
+
+    def test_health_timeout_is_capped_and_respects_a_smaller_setting(self) -> None:
+        calls, patcher = self._patch_health({"ok": True})
+        with patcher:
+            make_service(enabled=True, url="http://127.0.0.1:8788", timeout_seconds=180).health()
+            make_service(enabled=True, url="http://127.0.0.1:8788", timeout_seconds=5).health()
+
+        self.assertEqual([call["timeout"] for call in calls], [10.0, 5.0])
+
+
+class SentinelSolverProtocolTests(unittest.TestCase):
+    """与不同版本 solver 的协议兼容：请求体字段、鉴权头、端点路径、token 字段名。"""
+
+    def test_solve_sends_user_agent_only_when_set(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="k")
+        bodies: list[dict] = []
+
+        def fake_urlopen(request, timeout=None):
+            bodies.append(json.loads(request.data.decode()))
+            return FakeResponse({"ok": True, "turnstile": "T"})
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p", user_agent=SYSTEM_UA), "T")
+            self.assertEqual(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p", user_agent="  "), "T")
+
+        self.assertEqual(bodies[0], {"requirements": {"turnstile": {"dx": "d"}}, "p": "p", "user_agent": SYSTEM_UA})
+        self.assertNotIn("user_agent", bodies[1])
+
+    def test_solve_falls_back_to_v1_endpoint_on_404(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="k")
+        seen: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            if not request.full_url.endswith("/v1/turnstile"):
+                raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+            return FakeResponse({"ok": True, "turnstile": "T"})
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p"), "T")
+
+        self.assertEqual(seen, ["http://127.0.0.1:8788/turnstile", "http://127.0.0.1:8788/v1/turnstile"])
+
+    def test_solve_gives_up_when_both_endpoints_are_missing(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="k")
+        seen: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen), \
+                patch("services.sentinel_solver_service.logger") as logger:
+            self.assertIsNone(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p"))
+
+        self.assertEqual(len(seen), 2)
+        warnings = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertEqual([warning["event"] for warning in warnings], ["sentinel_solver_http_error"])
+        self.assertEqual((warnings[0]["status"], warnings[0]["path"]), (404, "/v1/turnstile"))
+
+    def test_solve_does_not_retry_other_http_errors(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="k")
+        seen: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, 500, "Boom", {}, None)
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen", fake_urlopen):
+            self.assertIsNone(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p"))
+
+        self.assertEqual(seen, ["http://127.0.0.1:8788/turnstile"])
+
+    def test_solve_accepts_token_field(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="k")
+
+        with patch("services.sentinel_solver_service.urllib.request.urlopen",
+                   lambda *a, **k: FakeResponse({"ok": True, "token": "T2"})):
+            self.assertEqual(service.solve_turnstile({"turnstile": {"dx": "d"}}, "p"), "T2")
+
+    def test_key_is_sent_as_both_headers(self) -> None:
+        service = make_service(enabled=True, url="http://127.0.0.1:8788", key="s3cret")
+        headers = service._headers(service.settings())
+
+        self.assertEqual(headers["X-Solver-Key"], "s3cret")
+        self.assertEqual(headers["Authorization"], "Bearer s3cret")
+        self.assertNotIn("Authorization", service._headers(service.settings(), with_key=False))
+        empty = make_service(enabled=True, url="http://127.0.0.1:8788", key="")
+        self.assertNotIn("Authorization", empty._headers(empty.settings()))
 
 
 class SentinelDateStringTests(unittest.TestCase):

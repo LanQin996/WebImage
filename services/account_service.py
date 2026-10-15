@@ -1574,6 +1574,7 @@ class AccountService:
         latency_ms: float | None = None,
         failure_kind: str = "transient",
         error: str = "",
+        cooldown_secs: float | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -1591,6 +1592,9 @@ class AccountService:
                         cooldown_until = datetime.fromisoformat(restore_at.replace("Z", "+00:00")).timestamp()
                     except ValueError:
                         cooldown_until = None
+            elif failure_kind == "model_unavailable" and cooldown_secs:
+                # 上游伪装 404：账号额度与有效性都无关，只做短期冷却避开该账号
+                cooldown_until = time.time() + float(cooldown_secs)
         image_runtime_repository.record_health_result(
             access_token,
             success,

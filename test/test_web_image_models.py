@@ -79,16 +79,37 @@ class UpstreamModelMappingTests(unittest.TestCase):
         upstream_model, _ = self._settings("gpt-image-2")
         self.assertEqual(upstream_model, config.default_upstream_model_name)
 
-    def test_default_upstream_model_is_the_instant_model_and_stays_overridable(self) -> None:
+    def test_default_upstream_model_falls_back_to_auto(self) -> None:
+        # 缺这个 key 的部署必须给图片接口发 `auto`；发文本模型名会被上游伪装成 404 Model not found
         store, tmp_dir = make_store({"auth-key": "test-auth"})
         self.addCleanup(tmp_dir.cleanup)
-        self.assertEqual(store.default_upstream_model_name, "gpt-6")
+        self.assertEqual(store.default_upstream_model_name, "auto")
 
+        # 自配值原样保存，是否被上游接受交给映射层兜底（见下）
         store.update({"default_upstream_model_name": "gpt-5-6"})
         self.assertEqual(store.default_upstream_model_name, "gpt-5-6")
 
-    def test_image_request_body_uses_the_instant_model_without_thinking_effort(self) -> None:
-        # instant 不是思考强度后缀（standard / extended / max），请求体里既不能被截断也不能带 thinking_effort
+    def test_configured_text_model_name_falls_back_to_auto_with_a_warning(self) -> None:
+        store, tmp_dir = make_store({"auth-key": "test-auth", "default_upstream_model_name": "gpt-5-6"})
+        self.addCleanup(tmp_dir.cleanup)
+
+        with (
+            mock.patch("services.openai_backend_api.config", store),
+            mock.patch("services.openai_backend_api.logger.warning") as warning,
+        ):
+            self.assertEqual(self._settings("gpt-image-2"), ("auto", ""))
+
+        self.assertEqual([call.args[0]["event"] for call in warning.call_args_list], ["image_model_mapping_fallback"])
+
+    def test_configured_image_slug_is_passed_through_unchanged(self) -> None:
+        store, tmp_dir = make_store({"auth-key": "test-auth", "default_upstream_model_name": SUNBURST})
+        self.addCleanup(tmp_dir.cleanup)
+
+        with mock.patch("services.openai_backend_api.config", store):
+            self.assertEqual(self._settings("gpt-image-2"), (SUNBURST, ""))
+
+    def test_image_request_body_uses_the_configured_upstream_model_without_thinking_effort(self) -> None:
+        # `auto` 不是思考强度后缀（standard / extended / max），请求体里既不能被截断也不能带 thinking_effort
         store, tmp_dir = make_store({"auth-key": "test-auth"})
         self.addCleanup(tmp_dir.cleanup)
         posts: list[tuple[str, dict]] = []
@@ -105,7 +126,7 @@ class UpstreamModelMappingTests(unittest.TestCase):
 
         [(url, kwargs)] = posts
         self.assertEqual(url, "https://chatgpt.com/backend-api/f/conversation")
-        self.assertEqual(kwargs["json"]["model"], "gpt-6")
+        self.assertEqual(kwargs["json"]["model"], "auto")
         self.assertNotIn("thinking_effort", kwargs["json"])
 
     def test_codex_model_keeps_its_own_slug(self) -> None:

@@ -32,6 +32,8 @@ import {
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
 
+import { resolveDefaultUpstreamModelName } from "./upstream-model-default";
+
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
@@ -185,7 +187,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
-    default_upstream_model_name: String(config.default_upstream_model_name || "gpt-6"),
+    default_upstream_model_name: resolveDefaultUpstreamModelName(config.default_upstream_model_name),
     default_thinking_effort: defaultThinkingEffort,
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
     ai_review: {
@@ -438,7 +440,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
-        default_upstream_model_name: String(config.default_upstream_model_name || "gpt-6").trim() || "gpt-6",
+        default_upstream_model_name: resolveDefaultUpstreamModelName(config.default_upstream_model_name),
         default_thinking_effort: ["standard", "extended", "max"].includes(String(config.default_thinking_effort))
           ? config.default_thinking_effort
           : "auto",

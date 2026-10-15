@@ -19,6 +19,7 @@ from services.image_storage_service import image_storage_service
 from services.means_storage_service import means_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -107,10 +108,60 @@ def is_connection_timeout_error(message: str) -> bool:
     )
 
 
-def is_cloudflare_challenge_error(message: str) -> bool:
-    """检测 Cloudflare 挑战页（HTML 形式的 403）：出口 IP 被临时拦截，与账号无关。"""
-    text = str(message or "").lower()
+def is_cloudflare_challenge_error(error: Exception | str) -> bool:
+    """检测 Cloudflare 挑战页（HTML 形式的 403）：出口 IP 被临时拦截，与账号无关。
+
+    优先读 `UpstreamHTTPError` 的结构化字段（status_code/body），
+    拿不到结构化对象时回退到旧的字符串匹配，保证两种来源都能识别。
+    """
+    if isinstance(error, UpstreamHTTPError):
+        if getattr(error, "cloudflare_challenge", False):
+            return True
+        if int(getattr(error, "status_code", 0) or 0) != 403:
+            return False
+        body = getattr(error, "body", "")
+        if isinstance(body, (dict, list)):
+            try:
+                text = json.dumps(body, ensure_ascii=False)
+            except (TypeError, ValueError):
+                text = repr(body)
+        else:
+            text = str(body or "")
+        text = text.lower()
+        return "<html" in text or "cloudflare" in text or "cf-mitigated" in text
+    text = str(error or "").lower()
     return "status=403" in text and "<html" in text
+
+
+# 上游图片接口对「模型名不被接受」和「Sentinel 握手评分不合格」统一回伪装 404，
+# 无法从响应体区分，因此统一按「模型名/握手被拒」处理。
+IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS = 600.0
+_IMAGE_MODEL_NOT_FOUND_CONTEXTS = (
+    "/backend-api/f/conversation",
+    "/backend-api/f/conversation/prepare",
+)
+# 伪装 404 的换号重试上限（独立于其它重试计数）
+MAX_IMAGE_MODEL_NOT_FOUND_RETRIES = 3
+
+
+def is_image_model_not_found_error(error: Exception | str) -> bool:
+    """识别图片接口的伪装 404（`{"detail": "Model not found"}`）。
+
+    上游不会对被拒绝的模型名/握手返回 403，而是统一回这个伪装 404。
+    只认结构化字段：404 + 图片对话上下文（`/backend-api/f/conversation` 与其 `/prepare`）
+    + body 为 `{"detail": "Model not found"}`，避免把普通 404（如会话不存在）误判。
+    """
+    if not isinstance(error, UpstreamHTTPError):
+        return False
+    if int(getattr(error, "status_code", 0) or 0) != 404:
+        return False
+    context = str(getattr(error, "context", "") or "")
+    if not any(item in context for item in _IMAGE_MODEL_NOT_FOUND_CONTEXTS):
+        return False
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return False
+    return str(body.get("detail") or "").strip() == "Model not found"
 
 
 def image_stream_error_message(message: str) -> str:
@@ -1414,7 +1465,22 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     cf_challenge_retry_count = 0
+    model_not_found_retry_count = 0
     account_email = ""
+
+    def model_not_found_error() -> ImageGenerationError:
+        """伪装 404 重试耗尽后的最终错误：保留模型名与账号，说明可能的原因。"""
+        return ImageGenerationError(
+            "Image generation failed: upstream returned 404 'Model not found' for model "
+            f"'{request.model}' (account {account_email or 'unknown'}). "
+            "The account or upstream does not accept this model name, "
+            "or the Sentinel handshake was rejected. Please try again later.",
+            status_code=502,
+            error_type="server_error",
+            code="upstream_model_not_found",
+            account_email=account_email,
+            conversation_id="",
+        )
 
     while True:
         try:
@@ -1428,6 +1494,9 @@ def _generate_single_image(
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
             )
         except ImageQuotaBusyError as exc:
+            # 账号已因伪装 404 全部进入短冷却：回报真实原因，避免用 429 掩盖模型名/握手问题
+            if model_not_found_retry_count:
+                raise model_not_found_error() from exc
             # 账号健康但全部在忙：返回 429 让客户端稍后重试，而不是 502
             raise ImageGenerationError(
                 str(exc) or "all image accounts are busy",
@@ -1437,19 +1506,29 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except RuntimeError as exc:
+            # 账号已因伪装 404 进入短冷却（调度器把 open 状态排除在候选之外，抛的是「没有可用账号」）：
+            # 回报真实原因，别用「没有可用账号」掩盖模型名/握手被拒这件事
+            if model_not_found_retry_count:
+                raise model_not_found_error() from exc
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         emitted_for_token = False
         returned_message = False
         returned_result = False
         account_attempt_started = time.time()
-        def mark_account_result(success: bool, failure_kind: str = "transient", error: str = "") -> None:
+        def mark_account_result(
+            success: bool,
+            failure_kind: str = "transient",
+            error: str = "",
+            cooldown_secs: float | None = None,
+        ) -> None:
             account_service.mark_image_result(
                 token,
                 success,
                 latency_ms=(time.time() - account_attempt_started) * 1000,
                 failure_kind=failure_kind,
                 error=error[:500],
+                cooldown_secs=cooldown_secs,
             )
         def emit_meta(**meta: Any) -> None:
             if request.meta_callback:
@@ -1618,6 +1697,27 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            # 伪装 404：上游对「模型名不被接受」与「Sentinel 握手评分不合格」统一回 Model not found。
+            # 与账号额度/有效性无关 → 不计 transient 失败，只给账号一段短冷却（熔断态）后换号重试
+            if is_image_model_not_found_error(exc):
+                mark_account_result(
+                    False,
+                    failure_kind="model_unavailable",
+                    error=last_error,
+                    cooldown_secs=IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS,
+                )
+                model_not_found_retry_count += 1
+                logger.warning({
+                    "event": "image_model_not_found",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "index": index,
+                    "retry_count": model_not_found_retry_count,
+                    "model": request.model,
+                })
+                if not emitted_for_token and model_not_found_retry_count <= MAX_IMAGE_MODEL_NOT_FOUND_RETRIES:
+                    continue
+                raise model_not_found_error() from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
                 # 401/403：先刷新 token；刷新成功进入 half-open 探测，失败沿用异常账号处理
                 account_service.invalidate_image_validation_cache(token)
@@ -1631,8 +1731,9 @@ def _generate_single_image(
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
             # Cloudflare 挑战页：出口 IP 被临时拦截，跟账号无关。不计入账号健康（避免把账号熔断），
-            # 换一个全新会话退避后重试
-            if is_cloudflare_challenge_error(last_error):
+            # 换一个全新会话退避后重试。这里传异常对象本身，让它走结构化字段判断，
+            # 不依赖 UpstreamHTTPError 的 message 格式
+            if is_cloudflare_challenge_error(exc):
                 mark_account_result(False, failure_kind="neutral", error=last_error)
                 if not emitted_for_token:
                     cf_challenge_retry_count += 1

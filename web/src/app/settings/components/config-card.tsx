@@ -173,9 +173,12 @@ export function ConfigCard() {
               <Input
                 value={String(config?.default_upstream_model_name || "")}
                 onChange={(event) => setDefaultUpstreamModelName(event.target.value)}
-                placeholder="gpt-6"
+                placeholder="auto"
               />
-              <p className="text-xs leading-5 text-muted-foreground">gpt-image-2 发起图片请求时使用的上游模型名称，默认 gpt-6。</p>
+              <p className="text-xs leading-5 text-muted-foreground">
+                网页生图（gpt-image-2）请求使用的上游模型名，默认 auto；也可填具体生图 slug（如 gpt-image-2.5-flare）。
+                填文本模型名可能导致上游返回 Model not found。
+              </p>
             </div>
             <div className="space-y-2">
               <label className="text-[13px] font-medium text-foreground/80">默认思考强度</label>

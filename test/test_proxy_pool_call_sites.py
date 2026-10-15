@@ -79,7 +79,7 @@ class BackendEgressTests(unittest.TestCase):
     def solver_proxy(self, api: OpenAIBackendAPI) -> str:
         captured: dict[str, str] = {}
 
-        def fake_solve(requirements, p_token, timeout=None, proxy=""):
+        def fake_solve(requirements, p_token, timeout=None, proxy="", **kwargs):
             captured["proxy"] = proxy
             return "TOKEN"
 
@@ -112,11 +112,13 @@ class BackendEgressTests(unittest.TestCase):
         self.assertEqual(len(FakeSession.created), 2)  # 主会话 + Codex 会话
         self.assertTrue(all(session.kwargs["proxy"] == "http://b.example:1" for session in FakeSession.created))
 
-    def test_non_pool_egress_does_not_send_proxy_to_solver(self) -> None:
+    def test_non_pool_egress_also_sends_proxy_to_solver(self) -> None:
+        # 全局/账号代理不是池出口（proxy_id 为空），但求解仍必须走同一出口 IP，
+        # 否则 turnstile 在一个 IP 上求解、业务请求从另一个 IP 发出，上游回伪装 404
         self.pool.update_settings({"enabled": False})
         api = OpenAIBackendAPI("")
         self.assertEqual(api.proxy_profile.proxy_url, GLOBAL_PROXY)
-        self.assertEqual(self.solver_proxy(api), "")
+        self.assertEqual(self.solver_proxy(api), GLOBAL_PROXY)
 
 
 class AccountSessionTests(unittest.TestCase):

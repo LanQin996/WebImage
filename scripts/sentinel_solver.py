@@ -7,8 +7,11 @@
 - 可选 `proxy`：账号所用的代理完整地址（可能带用户名密码），让求解与账号自身请求走同一出口 IP。
   代理凭据只留在本进程（带认证时由本地转发器持有，浏览器只拿到 127.0.0.1 的无认证地址），
   日志与 /health 里一律脱敏；
+- 可选 `user_agent`：本次求解页面的浏览器身份。主服务把当前请求指纹传进来，页面与请求头/TLS
+  指纹同源，避免"页面是 Mac、请求头是 Windows"被判为可疑；缺省用 `--user-agent` 或内置
+  Windows Chrome 146（与主服务 `FINGERPRINT_UA` 一致）。`GET /health` 返回默认 UA，供主服务同步；
 - 仍然不接收账号 token、Cookie 或用户 prompt；
-- 用 `X-Solver-Key` 鉴权，默认只监听 127.0.0.1。
+- 用 `X-Solver-Key`（或 `Authorization: Bearer`）鉴权，默认只监听 127.0.0.1。
 
 出口（lane）：
 - 不带 `proxy`：默认浏览器上下文 + `SENTINEL_SOLVER_PROXY`，与旧版一致；
@@ -217,15 +220,43 @@ class _CdpSession:
         self.sock.close()
 
 
+# 求解页面的浏览器身份。必须与 services/openai_backend_api.py 的 FINGERPRINT_UA 字符级一致：
+# 主服务用 curl_cffi chrome146（Chrome 146 的 TLS/HTTP2 指纹）+ 这套请求头出网，页面却是 macOS
+# Edge 148 时，Sentinel 握手会因指纹自相矛盾被拒（上游表现为 404 {"detail": "Model not found"}）。
+# test/test_solver_fingerprint_consistency.py 断言两者相等。
+WINDOWS_CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+DEFAULT_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
+# navigator.platform 必须与 UA 里的系统对上：真实 Chrome 在 Windows 上报的是 "Win32"
+# （"Windows" 只出现在 sec-ch-ua-platform 头里，主服务的请求头用的就是后者）。
+DEFAULT_PLATFORM = "Win32"
+_PLATFORM_MARKERS = (
+    ("Windows", "Win32"),
+    ("Macintosh", "MacIntel"),
+    ("Mac OS X", "MacIntel"),
+    ("Linux", "Linux x86_64"),
+)
+
+
+def platform_for_user_agent(user_agent: str) -> str:
+    """按 UA 推断 navigator.platform；认不出系统时用默认（Windows，与默认 UA 匹配）。"""
+    value = str(user_agent or "")
+    for marker, platform in _PLATFORM_MARKERS:
+        if marker in value:
+            return platform
+    return DEFAULT_PLATFORM
+
+
 class CdpPage(_CdpSession):
     """够用的 CDP 页面驱动：导航 + 执行 JS。
 
     不带 target_id 时经 /json/new 在默认上下文开新 tab；带 target_id 时直接连接
     /devtools/page/{id}（代理 lane 在自己的浏览器上下文里用 Target.createTarget 建的 tab）。
+    页面 UA 由主服务决定：默认用 `UA`，请求带了 `user_agent` 时用 `set_user_agent` 切换
+    （代理 lane 与默认 lane 的页面都会跨请求复用，UA 跟着每次求解走）。
     """
 
-    UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0")
+    UA = WINDOWS_CHROME_UA
 
     def __init__(self, cdp_port: int, user_agent: str | None = None, target_id: str | None = None) -> None:
         if target_id:
@@ -238,13 +269,29 @@ class CdpPage(_CdpSession):
             target_id = str(info.get("id") or "")
         self.target_id = target_id
         super().__init__(ws_url, timeout=120)
+        self.user_agent = str(user_agent or "").strip() or self.UA
         self.send("Page.enable")
         self.send("Runtime.enable")
+        self._override_user_agent(self.user_agent)
+
+    def _override_user_agent(self, user_agent: str) -> None:
         self.send("Emulation.setUserAgentOverride", {
-            "userAgent": user_agent or self.UA,
-            "acceptLanguage": "zh-CN,zh;q=0.9,en;q=0.8",
-            "platform": "macOS",
+            "userAgent": user_agent,
+            "acceptLanguage": DEFAULT_ACCEPT_LANGUAGE,
+            "platform": platform_for_user_agent(user_agent),
         })
+
+    def set_user_agent(self, user_agent: str) -> bool:
+        """切换本页面 UA（连同 navigator.platform）；返回是否真的下发过 override。
+
+        空值忽略（沿用当前 UA），与当前一致时不下发，避免每次求解都多一次 CDP 往返。
+        """
+        value = str(user_agent or "").strip()
+        if not value or value == self.user_agent:
+            return False
+        self._override_user_agent(value)
+        self.user_agent = value
+        return True
 
     def evaluate(self, expression: str, timeout: float = 120) -> Any:
         result = self.send("Runtime.evaluate",
@@ -855,7 +902,19 @@ def build_turnstile_script(requirements: dict, p_token: str) -> str:
                                 json.dumps(FALLBACK_TURNSTILE_URL), json.dumps(VM_TIMEOUT_MARK))
 
 
+# Windows 上浏览器通常不在 PATH 里，也默认装在 Program Files；Chrome 优先，系统自带的 Edge 兜底。
+# 只作为兜底：--chrome / SENTINEL_SOLVER_CHROME 给的路径最优先。
+WINDOWS_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe",
+]
+
 DEFAULT_CHROME_CANDIDATES = [
+    *[os.path.expandvars(path) for path in WINDOWS_CHROME_CANDIDATES],
     os.path.expanduser("~/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/"
                        "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1201,12 +1260,27 @@ class BrowserPool:
     # -- 求解 ------------------------------------------------------------------
 
     @staticmethod
+    def _apply_user_agent(page: Any, user_agent: str) -> None:
+        """把本次请求的 UA 切到页面上（lane 复用 tab，可能残留上一次的 UA）。
+
+        页面不支持切换（测试替身）时跳过；切换失败只记日志不中断，求解仍按当前 UA 进行。
+        """
+        setter = getattr(page, "set_user_agent", None)
+        if not user_agent or not callable(setter):
+            return
+        try:
+            setter(user_agent)
+        except Exception as exc:
+            LOG.warning("切换页面 UA 失败（沿用当前 UA）: %s", str(exc)[:200])
+
+    @staticmethod
     def _solve_attempts(lock: threading.Lock, get_page: Callable[[], Any], script: str,
-                        label: str) -> tuple[bool, str]:
+                        label: str, user_agent: str = "") -> tuple[bool, str]:
         error = ""
         for attempt in range(1, VM_TIMEOUT_ATTEMPTS + 1):
             with lock:
                 page = get_page()
+                BrowserPool._apply_user_agent(page, user_agent)
                 token = str(page.evaluate(script, timeout=180) or "")
             if not token.startswith("ERR:"):
                 return bool(token), token
@@ -1217,11 +1291,21 @@ class BrowserPool:
             LOG.info("turnstile VM 超时（%s，第 %d/%d 次）: %s", label, attempt, VM_TIMEOUT_ATTEMPTS, error)
         return False, error
 
-    def solve(self, requirements: dict, p_token: str, proxy: str = "") -> tuple[bool, str]:
-        """proxy 为空走默认 lane；否则走该代理的 lane，失败也不会回落到默认 lane。"""
+    def current_user_agent(self) -> str:
+        """当前默认 UA（= 主服务的请求指纹）；逐请求覆盖只作用于那一次求解。"""
+        return str(self.user_agent or "").strip() or CdpPage.UA
+
+    def solve(self, requirements: dict, p_token: str, proxy: str = "",
+              user_agent: str = "") -> tuple[bool, str]:
+        """proxy 为空走默认 lane；否则走该代理的 lane，失败也不会回落到默认 lane。
+
+        user_agent 为空时用默认 UA（`--user-agent` 或内置 Windows Chrome 146）。求解前总会把页面切到
+        本次要用的 UA（含 navigator.platform），否则 lane 复用的 tab 会残留上一次请求的身份。
+        """
         script = build_turnstile_script(requirements, p_token)
+        agent = str(user_agent or "").strip() or self.current_user_agent()
         if not str(proxy or "").strip():
-            return self._solve_attempts(self._lock, self.page, script, "default")
+            return self._solve_attempts(self._lock, self.page, script, "default", agent)
         spec = parse_proxy_url(proxy)
         self.reap()                               # 顺手回收空闲 lane
         try:
@@ -1231,7 +1315,8 @@ class BrowserPool:
             return False, str(exc)
         ok = False
         try:
-            ok, text = self._solve_attempts(lane.lock, lambda: self._lane_page(lane), script, lane.redacted)
+            ok, text = self._solve_attempts(lane.lock, lambda: self._lane_page(lane), script,
+                                            lane.redacted, agent)
             return ok, text
         finally:
             self._release_lane(lane, ok)
@@ -1314,15 +1399,32 @@ def make_handler(pool: BrowserPool, key: str):
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_body(self) -> bytes:
+            """先把请求体读完再决定怎么回。
+
+            请求体没读完就关连接，客户端可能收到 RST 而读不到响应（Windows 上表现为
+            ConnectionAbortedError），鉴权失败/路径不对时尤其明显。
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            return self.rfile.read(length) if length > 0 else b""
+
         def _authorized(self) -> bool:
-            return bool(key) and self.headers.get("X-Solver-Key") == key
+            if not key:
+                return False
+            if self.headers.get("X-Solver-Key") == key:
+                return True
+            # 客户端两种鉴权头都会发（一些实现只认 Bearer），这里同时认
+            return self.headers.get("Authorization") == f"Bearer {key}"
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
                 ready, detail = pool.probe()
                 lanes = pool.lanes_snapshot()
                 return self._send(200 if ready else 503, {
-                    "ok": ready, "browser": detail,
+                    "ok": ready, "browser": detail, "user_agent": pool.current_user_agent(),
                     "lanes": lanes, "lane_count": len(lanes), "max_lanes": pool.max_lanes,
                 })
             if not self._authorized():
@@ -1330,13 +1432,13 @@ def make_handler(pool: BrowserPool, key: str):
             return self._send(404, {"ok": False, "error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
+            raw = self._read_body()
             if not self._authorized():
                 return self._send(401, {"ok": False, "error": "bad key"})
-            if self.path != "/turnstile":
+            if self.path not in ("/turnstile", "/v1/turnstile"):
                 return self._send(404, {"ok": False, "error": "not found"})
-            length = int(self.headers.get("Content-Length") or 0)
             try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                payload = json.loads(raw or b"{}")
             except Exception as exc:
                 return self._send(400, {"ok": False, "error": f"bad json: {exc}"})
             if not isinstance(payload, dict):
@@ -1352,13 +1454,17 @@ def make_handler(pool: BrowserPool, key: str):
                     label = parse_proxy_url(proxy).redacted()
                 except ValueError as exc:
                     return self._send(400, {"ok": False, "error": f"bad proxy: {exc}", "lane": lane})
+            raw_user_agent = payload.get("user_agent")
+            if raw_user_agent is not None and not isinstance(raw_user_agent, str):
+                return self._send(400, {"ok": False, "error": "user_agent must be a string", "lane": lane})
+            user_agent = (raw_user_agent or "").strip()
             requirements = payload.get("requirements")
             p_token = payload.get("p")
             if not isinstance(requirements, dict) or not p_token:
                 return self._send(400, {"ok": False, "error": "requirements/p required", "lane": lane})
             started = time.time()
             try:
-                ok, token = pool.solve(requirements, str(p_token), proxy=proxy)
+                ok, token = pool.solve(requirements, str(p_token), proxy=proxy, user_agent=user_agent)
             except Exception as exc:
                 message = _scrub(str(exc), proxy)
                 LOG.warning("求解失败（lane=%s）: %s", label, message[:200])
@@ -1381,14 +1487,15 @@ def main() -> int:
                         help="监听地址；容器内需要 0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("SENTINEL_SOLVER_PORT", "8788")))
     parser.add_argument("--key", default=os.environ.get("SENTINEL_SOLVER_KEY", ""),
-                        help="必须设置；请求需带 X-Solver-Key")
+                        help="必须设置；请求需带 X-Solver-Key（或 Authorization: Bearer）")
     parser.add_argument("--cdp-port", type=int, default=int(os.environ.get("SENTINEL_SOLVER_CDP_PORT", "9333")))
     parser.add_argument("--chrome", default=os.environ.get("SENTINEL_SOLVER_CHROME", ""))
     parser.add_argument("--profile-dir", default=os.environ.get("SENTINEL_SOLVER_PROFILE_DIR", "/tmp/chatgpt2api-solver-profile"))
     parser.add_argument("--proxy", default=os.environ.get("SENTINEL_SOLVER_PROXY", ""),
                         help="默认 lane（请求不带 proxy 时）的浏览器出口；可带认证")
     parser.add_argument("--page-url", default=os.environ.get("SENTINEL_SOLVER_PAGE_URL", "https://chatgpt.com/"))
-    parser.add_argument("--user-agent", default="")
+    parser.add_argument("--user-agent", default="",
+                        help="默认页面 UA；缺省用内置的 Windows Chrome 146（与主服务 FINGERPRINT_UA 一致）")
     parser.add_argument("--max-lanes", type=int, default=int(os.environ.get("SENTINEL_SOLVER_MAX_LANES", "8")),
                         help="代理 lane 上限（每个约 150-250MB 内存），超出按 LRU 回收；0 表示不接受带 proxy 的请求")
     parser.add_argument("--lane-idle-secs", type=float,
@@ -1432,6 +1539,8 @@ def main() -> int:
         LOG.info("浏览器就绪，页面已加载: %s", pool.warm_up() or "?")    # 预热默认 lane
     except Exception as exc:
         LOG.warning("预热失败（首个请求会重试）: %s", str(exc)[:400])
+    # 主服务会从 /health 读它来对齐请求指纹，启动时打出来便于比对
+    LOG.info("默认页面 UA: %s", pool.current_user_agent())
     pool.start_reaper()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(pool, args.key))

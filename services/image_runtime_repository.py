@@ -14,6 +14,8 @@ from services.config import DATA_DIR
 
 
 DEFAULT_RUNTIME_DB = DATA_DIR / "image_runtime.db"
+# 与账号自身健康无关、但需短期避开的失败（如上游伪装 404）的默认冷却时长
+MODEL_UNAVAILABLE_COOLDOWN_SECS = 600.0
 DEFAULT_HEALTH = {
     "health_score": 100,
     "health_state": "healthy",
@@ -450,9 +452,13 @@ class ImageRuntimeRepository:
         - rate_limit: 429/额度限制，冷却至 restore_at（cooldown_until）或 15 分钟
         - auth_refreshed: 401/403 且 token 刷新成功，进入 half_open 探测
         - neutral: 内容策略/参数错误/客户端取消/存储错误，不影响健康
+        - model_unavailable: 上游伪装 404（模型名/握手被拒），不计失败与健康分，
+          只做短冷却（cooldown_until 或默认 600 秒）
         """
         if not success and failure_kind == "neutral":
             return self.get_health(access_token)
+        if not success and failure_kind == "model_unavailable":
+            return self.sideline_health(access_token, cooldown_until=cooldown_until, error=error)
         self.get_health(access_token)  # 确保行存在
         key = account_health_key(access_token)
         alpha = 0.2
@@ -531,6 +537,35 @@ class ImageRuntimeRepository:
                 WHERE account_key=?
                 """,
                 (score, state, success_ewma, latency_ewma, failures, cooldown, window, error or None, now, key),
+            )
+            conn.execute("COMMIT")
+        return self.get_health(access_token)
+
+    def sideline_health(
+        self,
+        access_token: str,
+        *,
+        cooldown_until: float | None = None,
+        error: str = "",
+    ) -> dict[str, object]:
+        """把账号健康状态置为 open 直到 cooldown_until（默认 600 秒后）。
+
+        用于与账号自身健康无关、只应短期避开的失败：不改健康分、success_ewma 与
+        连续失败计数，冷却结束后由 get_health 自动转 half_open 做单次探测。
+        """
+        self.get_health(access_token)  # 确保行存在
+        key = account_health_key(access_token)
+        now = time.time()
+        until = cooldown_until if cooldown_until and cooldown_until > now else now + MODEL_UNAVAILABLE_COOLDOWN_SECS
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE image_account_health
+                SET state='open', cooldown_until=?, last_error=?, updated_ts=?
+                WHERE account_key=?
+                """,
+                (until, error or None, now, key),
             )
             conn.execute("COMMIT")
         return self.get_health(access_token)
