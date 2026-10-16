@@ -14,7 +14,6 @@ import tiktoken
 
 from services.account_service import ImageQuotaBusyError, account_service
 from services.config import config
-from services.cpu_image_upscale import parse_4k_size, upscale_to_4k
 from services.image_runtime_repository import account_health_key
 from services.image_storage_service import image_storage_service
 from services.means_storage_service import means_storage_service
@@ -400,10 +399,8 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
-    size: str | None = None,
 ) -> dict[str, Any]:
     response_format = normalize_image_response_format(response_format)
-    upscale_4k = parse_4k_size(size) is not None
     data: list[dict[str, Any]] = []
     log_urls: list[str] = []
     for item in items:
@@ -412,9 +409,6 @@ def format_image_result(
         b64_json = str(item.get("b64_json") or "").strip()
         if raw_bytes is None and not b64_json:
             continue
-        if upscale_4k:
-            raw_bytes = upscale_to_4k(raw_bytes if raw_bytes is not None else base64.b64decode(b64_json), size)
-            b64_json = ""
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             payload = raw_bytes if raw_bytes is not None else base64.b64decode(b64_json)
@@ -1178,7 +1172,6 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
-            size=request.size,
         )
         data = formatted["data"]
         if data:
@@ -1278,7 +1271,6 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
-                        size=request.size,
                     )
                     data = formatted["data"]
                     if data:
@@ -1393,7 +1385,6 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
-                    size=request.size,
                 )
                 data = formatted["data"]
                 if data:
@@ -1458,7 +1449,6 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
-        size=request.size,
     )
     data = formatted["data"]
     if data:
