@@ -20,7 +20,7 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id", "_log_urls"}
 # 深翻页时的扫描上限，避免筛选条件命中极少时把整个日志文件读完
 MAX_SCAN_LINES = 200_000
 
@@ -191,7 +191,7 @@ def _collect_urls(value: object) -> list[str]:
         for key, item in value.items():
             if key == "url" and isinstance(item, str):
                 urls.append(item)
-            elif key == "urls" and isinstance(item, list):
+            elif key in {"urls", "_log_urls"} and isinstance(item, list):
                 urls.extend(str(url) for url in item if isinstance(url, str))
             else:
                 urls.extend(_collect_urls(item))
@@ -316,9 +316,7 @@ class LoggedCall:
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            return response
+            return _strip_internal_response_fields(result)
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:

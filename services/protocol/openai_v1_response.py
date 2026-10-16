@@ -396,7 +396,10 @@ def stream_image_response(
             )
             for output_index, item in enumerate(items):
                 yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-            yield response_completed(response_id, model, created, items, usage)
+            completed = response_completed(response_id, model, created, items, usage)
+            if output.log_urls:
+                completed["_log_urls"] = output.log_urls
+            yield completed
             return
     raise RuntimeError("image generation failed")
 
@@ -406,6 +409,8 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in events:
         if event.get("type") == "response.completed":
             completed = event.get("response") if isinstance(event.get("response"), dict) else {}
+            if event.get("_log_urls"):
+                completed = {**completed, "_log_urls": event["_log_urls"]}
     if not completed:
         raise RuntimeError("response generation failed")
     return completed

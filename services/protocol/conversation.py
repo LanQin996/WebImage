@@ -405,6 +405,7 @@ def format_image_result(
     response_format = normalize_image_response_format(response_format)
     upscale_4k = parse_4k_size(size) is not None
     data: list[dict[str, Any]] = []
+    log_urls: list[str] = []
     for item in items:
         raw_bytes = item.get("_bytes")
         raw_bytes = bytes(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray, memoryview)) else None
@@ -417,10 +418,12 @@ def format_image_result(
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             payload = raw_bytes if raw_bytes is not None else base64.b64decode(b64_json)
-            image_storage_service.save(
+            stored = image_storage_service.save(
                 payload, base_url,
                 storage_mode="local" if means_storage_service.enabled() else None,
             )
+            if isinstance(stored.url, str) and stored.url:
+                log_urls.append(stored.url)
             data.append({
                 # bytes 输入仅编码一次；base64 输入直接透传，避免重复转换
                 "b64_json": b64_json or base64.b64encode(raw_bytes or b"").decode("ascii"),
@@ -433,6 +436,8 @@ def format_image_result(
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
+    if log_urls:
+        result["_log_urls"] = log_urls
     if message and not data:
         result["message"] = message
     return result
@@ -477,6 +482,7 @@ class ImageOutput:
     text: str = ""
     upstream_event_type: str = ""
     data: list[dict[str, Any]] = field(default_factory=list)
+    log_urls: list[str] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
 
@@ -507,6 +513,8 @@ class ImageOutput:
                 "object": "image.generation.result",
                 "data": self.data,
             })
+            if self.log_urls:
+                chunk["_log_urls"] = self.log_urls
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
         return chunk
@@ -1164,16 +1172,18 @@ def stream_image_outputs(
             {"_bytes": image_data}
             for image_data in backend.download_image_bytes(image_urls)
         ]
-        data = format_image_result(
+        formatted = format_image_result(
             image_items,
             request.prompt,
             request.response_format,
             request.base_url,
             int(time.time()),
             size=request.size,
-        )["data"]
+        )
+        data = formatted["data"]
         if data:
-            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data,
+                              log_urls=formatted.get("_log_urls", []), conversation_id=conversation_id)
         return
 
     if message:
@@ -1262,16 +1272,18 @@ def stream_image_outputs(
                         {"_bytes": image_data}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
-                    data = format_image_result(
+                    formatted = format_image_result(
                         image_items,
                         request.prompt,
                         request.response_format,
                         request.base_url,
                         int(time.time()),
                         size=request.size,
-                    )["data"]
+                    )
+                    data = formatted["data"]
                     if data:
-                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data,
+                                          log_urls=formatted.get("_log_urls", []), conversation_id=conversation_id)
                         return
         elif is_text_reply:
             logger.warning({
@@ -1375,16 +1387,18 @@ def stream_image_outputs(
                     {"_bytes": image_data}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
-                data = format_image_result(
+                formatted = format_image_result(
                     image_items,
                     request.prompt,
                     request.response_format,
                     request.base_url,
                     int(time.time()),
                     size=request.size,
-                )["data"]
+                )
+                data = formatted["data"]
                 if data:
-                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data,
+                                      log_urls=formatted.get("_log_urls", []), conversation_id=conversation_id)
                     return
         
         # 重试后仍然失败，yield 错误消息
@@ -1438,16 +1452,18 @@ def stream_codex_image_outputs(
     )))
     if not images:
         raise ImageGenerationError("No image result found in response")
-    data = format_image_result(
+    formatted = format_image_result(
         [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
         request.prompt,
         request.response_format,
         request.base_url,
         int(time.time()),
         size=request.size,
-    )["data"]
+    )
+    data = formatted["data"]
     if data:
-        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
+        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data,
+                          log_urls=formatted.get("_log_urls", []))
         return
     raise ImageGenerationError("No image result found in response")
 
@@ -1888,6 +1904,7 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    log_urls: list[str] = []
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
@@ -1898,6 +1915,7 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             message = output.text
         elif output.kind == "result":
             data.extend(output.data)
+            log_urls.extend(output.log_urls)
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:
@@ -1906,4 +1924,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if log_urls:
+        result["_log_urls"] = list(dict.fromkeys(log_urls))
     return result

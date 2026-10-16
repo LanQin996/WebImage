@@ -250,6 +250,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     response["usage"] = chat_usage_from_image_usage(usage)
+    if result.get("_log_urls"):
+        response["_log_urls"] = result["_log_urls"]
     return response
 
 
@@ -285,9 +287,12 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             continue
         if not sent_role:
             sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
         else:
-            yield completion_chunk(model, {"content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"content": content}, None, completion_id, created)
+        if output.log_urls:
+            chunk["_log_urls"] = output.log_urls
+        yield chunk
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
