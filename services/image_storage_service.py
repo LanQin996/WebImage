@@ -175,10 +175,10 @@ class ImageStorageService:
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         self.repository.replace_images(items)
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
+    def _public_url(self, rel: str, base_url: str | None = None, *, local_only: bool = False) -> str:
         settings = self.settings()
         public_base_url = _clean(settings.get("public_base_url"))
-        if public_base_url:
+        if public_base_url and not local_only:
             return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
         return f"{(base_url or config.base_url).rstrip('/')}/images/{_safe_relative_path(rel)}"
 
@@ -188,9 +188,9 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+    def save(self, image_data: bytes, base_url: str | None = None, *, storage_mode: str | None = None) -> StoredImage:
         rel = self.make_relative_path(image_data)
-        mode = self.mode()
+        mode = storage_mode or self.mode()
         if mode not in {"local", "webdav", "both"}:
             mode = "local"
         stored_local = False
@@ -224,7 +224,10 @@ class ImageStorageService:
             item["width"], item["height"] = dimensions
         # 单行 upsert，不再读取并重写完整图片索引
         self.repository.upsert_image(rel, item)
-        return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+        return StoredImage(
+            rel=rel, url=self._public_url(rel, base_url, local_only=stored_local and not stored_webdav),
+            storage=str(item["storage"]), size=len(image_data),
+        )
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)
@@ -311,7 +314,7 @@ class ImageStorageService:
                     **item,
                     "rel": rel,
                     "path": rel,
-                    "url": self._public_url(rel, base_url),
+                    "url": self._public_url(rel, base_url, local_only=local and not webdav),
                 })
             if changed:
                 self._save_index(indexed)

@@ -25,6 +25,7 @@ import {
   type CPARemoteFile,
   type ImageStorageMode,
   type ImageStorageSettings,
+  type MeansSettings,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
@@ -206,6 +207,19 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
       public_base_url: String(imageStorage.public_base_url || ""),
     },
+    means: {
+      enabled: Boolean(config.means?.enabled),
+      endpoint: String(config.means?.endpoint || ""),
+      access_key: String(config.means?.access_key || ""),
+      secret_key: String(config.means?.secret_key || ""),
+      bucket: String(config.means?.bucket || ""),
+      prefix: String(config.means?.prefix || "chatgpt2api/images"),
+      public_base_url: String(config.means?.public_base_url || ""),
+      region: String(config.means?.region || "us-east-1"),
+      service: String(config.means?.service || "s3"),
+      timeout_seconds: Number(config.means?.timeout_seconds || 60),
+      verify_ssl: config.means?.verify_ssl !== false,
+    },
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
     backup: {
@@ -318,6 +332,7 @@ type SettingsStore = {
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
   setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
+  setMeansField: (key: keyof MeansSettings, value: string | boolean) => void;
   setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
   setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
   setProxyRuntimeStatusCodesText: (value: string) => void;
@@ -464,6 +479,20 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           webdav_password: String(config.image_storage?.webdav_password || "").trim(),
           webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
+        },
+        means: {
+          ...config.means,
+          enabled: Boolean(config.means?.enabled),
+          endpoint: String(config.means?.endpoint || "").trim(),
+          access_key: String(config.means?.access_key || "").trim(),
+          secret_key: String(config.means?.secret_key || "").trim(),
+          bucket: String(config.means?.bucket || "").trim(),
+          prefix: String(config.means?.prefix || "chatgpt2api/images").trim(),
+          public_base_url: String(config.means?.public_base_url || "").trim(),
+          region: String(config.means?.region || "us-east-1").trim(),
+          service: String(config.means?.service || "s3").trim(),
+          timeout_seconds: Math.max(1, Number(config.means?.timeout_seconds) || 60),
+          verify_ssl: config.means?.verify_ssl !== false,
         },
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),
@@ -678,6 +707,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
       };
     });
+  },
+
+  setMeansField: (key, value) => {
+    set((state) => state.config?.means ? {
+      config: { ...state.config, means: { ...state.config.means, [key]: value } },
+    } : {});
   },
 
   setProxyRuntimeField: (key, value) => {

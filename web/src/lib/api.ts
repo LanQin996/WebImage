@@ -263,6 +263,20 @@ export type ImageStorageSettings = {
   public_base_url: string;
 };
 
+export type MeansSettings = {
+  enabled: boolean;
+  endpoint: string;
+  access_key: string;
+  secret_key: string;
+  bucket: string;
+  prefix: string;
+  public_base_url: string;
+  region: string;
+  service: string;
+  timeout_seconds: number;
+  verify_ssl: boolean;
+};
+
 export type Account = {
   access_token: string;
   type: AccountType;
@@ -455,6 +469,7 @@ export type SettingsConfig = {
   auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
+  means?: MeansSettings;
   proxy_runtime?: ProxyRuntimeSettings;
   third_party_apps?: ThirdPartyAppsSettings;
   backup?: BackupSettings;

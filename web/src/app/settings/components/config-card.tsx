@@ -57,6 +57,7 @@ export function ConfigCard() {
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
   const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
   const setImageStorageField = useSettingsStore((state) => state.setImageStorageField);
+  const setMeansField = useSettingsStore((state) => state.setMeansField);
   const testImageStorage = useSettingsStore((state) => state.testImageStorage);
   const syncImagesToWebDAV = useSettingsStore((state) => state.syncImagesToWebDAV);
   const isTestingImageStorage = useSettingsStore((state) => state.isTestingImageStorage);
@@ -512,6 +513,45 @@ export function ConfigCard() {
                   disabled={!config?.image_storage?.enabled}
                 />
                 <p className="text-xs leading-5 text-muted-foreground">留空时返回本应用 /images/... 代理地址；填入后直接返回公开图片地址。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-5 border-t border-border pt-5">
+          <h3 className="text-[15px] font-semibold tracking-tight">Means 对象存储</h3>
+          <div className="space-y-4">
+            <label className="flex items-center justify-between gap-4 rounded-2xl border border-border bg-field/50 px-4 py-3">
+              <span className="text-[13px] font-medium text-foreground/80">启用 Means 图片上传</span>
+              <Switch
+                checked={Boolean(config?.means?.enabled)}
+                onCheckedChange={(checked) => setMeansField("enabled", Boolean(checked))}
+              />
+            </label>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">Endpoint</label>
+                <Input value={config?.means?.endpoint || ""} onChange={(event) => setMeansField("endpoint", event.target.value)} disabled={!config?.means?.enabled} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">Bucket</label>
+                <Input value={config?.means?.bucket || ""} onChange={(event) => setMeansField("bucket", event.target.value)} disabled={!config?.means?.enabled} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">Access Key</label>
+                <Input value={config?.means?.access_key || ""} onChange={(event) => setMeansField("access_key", event.target.value)} disabled={!config?.means?.enabled} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">Secret Key</label>
+                <Input type="password" value={config?.means?.secret_key || ""} onChange={(event) => setMeansField("secret_key", event.target.value)} disabled={!config?.means?.enabled} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">路径前缀</label>
+                <Input value={config?.means?.prefix || ""} onChange={(event) => setMeansField("prefix", event.target.value)} disabled={!config?.means?.enabled} />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[13px] font-medium text-foreground/80">公开访问前缀</label>
+                <Input value={config?.means?.public_base_url || ""} onChange={(event) => setMeansField("public_base_url", event.target.value)} disabled={!config?.means?.enabled} />
               </div>
             </div>
           </div>

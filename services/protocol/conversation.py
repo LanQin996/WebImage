@@ -237,7 +237,9 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
 
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
     if means_storage_service.enabled():
-        return means_storage_service.upload(image_data)
+        url = means_storage_service.upload(image_data)
+        image_storage_service.save(image_data, base_url, storage_mode="local")
+        return url
     return image_storage_service.save(image_data, base_url).url
 
 
@@ -408,6 +410,11 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
+            payload = raw_bytes if raw_bytes is not None else base64.b64decode(b64_json)
+            image_storage_service.save(
+                payload, base_url,
+                storage_mode="local" if means_storage_service.enabled() else None,
+            )
             data.append({
                 # bytes 输入仅编码一次；base64 输入直接透传，避免重复转换
                 "b64_json": b64_json or base64.b64encode(raw_bytes or b"").decode("ascii"),

@@ -92,6 +92,22 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(payload, FakeWebDAVClient.uploaded[stored.rel])
 
+    def test_local_override_uses_app_url_when_webdav_has_public_prefix(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "webdav",
+            "public_base_url": "https://dav.example.test/images",
+        })
+        service = self.service()
+        stored = service.save(png_bytes(), "http://app.test", storage_mode="local")
+        listed = service.list_items("http://app.test")
+
+        self.assertEqual(stored.storage, "local")
+        self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+        self.assertEqual(listed[0]["url"], stored.url)
+        self.assertTrue((self.images_dir / stored.rel).is_file())
+        self.assertEqual(FakeWebDAVClient.uploaded, {})
+
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()
         image_path = self.images_dir / "2026" / "05" / "07" / "sample.png"
