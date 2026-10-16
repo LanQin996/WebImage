@@ -158,14 +158,18 @@ class AccountService:
     def _quota_known(account: dict) -> bool:
         """额度是否已知（非「额度未知」态）。
 
-        「额度未知」定义为 quota == 0 且 limits_progress 为空：探测成功时上游
-        一定会带回 image_gen 条目，所以 limits_progress 为空只可能是从未探测
-        成功（例如注册后首次刷新被 Cloudflare 拦截）。真正耗尽的账号
-        quota == 0，但 limits_progress 非空且 image_gen 的 remaining 为 0。
+        「额度未知」定义为 quota == 0 且 limits_progress 里没有 image_gen 条目：
+        探测成功时上游一定会带回 image_gen，所以缺条目只可能是从未探测成功
+        （例如注册后首次刷新被 Cloudflare 拦截）。真正耗尽的账号 quota == 0，
+        但 limits_progress 里 image_gen 的 remaining 为 0。
+
+        判定必须与 _has_image_gen_reading 一致：只看列表是否非空，会把一份
+        「不含 image_gen 的降级响应」误判成已耗尽，账号因此既排不进调度、
+        也进不了补探测名单，水位守护照样会反复补号。
         """
         if not isinstance(account, dict):
             return False
-        if account.get("limits_progress"):
+        if _has_image_gen_reading(account):
             return True
         return int(account.get("quota") or 0) > 0
 

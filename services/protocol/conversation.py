@@ -1082,16 +1082,12 @@ def stream_image_outputs(
                 "error": repr(exc)[:300],
             })
 
-    # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
-    # 这样可以避免不必要的长时间轮询超时
-    # 注意：当 should_poll_for_image 为 True 或检测到文本回复时，
-    # 即使 tasks 报告了"错误"，也不能直接返回——因为上游可能将工具调用的 JSON 参数
-    # （如 {"size":"1792x1024","n":1}）标记为 is_error，而实际上图片正在异步生成中。
-    # 此时应继续轮询图片。
+    # 已确认正在生图时，tasks 的错误可能只是工具参数；跳过这次串行查询，
+    # 轮询首轮查不到图片时再查询。未触发图片工具时仍检查明确的任务错误。
     detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
+    if not file_ids and not sediment_ids and conversation_id and not should_poll_for_image:
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
-        if detailed_error and not should_poll_for_image and not is_text_reply:
+        if detailed_error and not is_text_reply:
             logger.info({
                 "event": "image_task_error_before_poll",
                 "conversation_id": conversation_id,
@@ -1099,7 +1095,7 @@ def stream_image_outputs(
             })
             yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=detailed_error, conversation_id=conversation_id)
             return
-        if detailed_error and (should_poll_for_image or is_text_reply):
+        if detailed_error and is_text_reply:
             logger.info({
                 "event": "image_task_error_skipped_for_poll",
                 "conversation_id": conversation_id,

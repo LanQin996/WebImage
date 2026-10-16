@@ -2300,11 +2300,9 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 10s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
-        - Subsequent polls are image_poll_interval_secs apart (default 10s).
+        - Sleeps image_poll_initial_wait_secs first (default 2s, +jitter) to let
+          the conversation document commit after the SSE stream closes.
+        - Subsequent polls are image_poll_interval_secs apart (default 3s).
         - On upstream 429 / 5xx or network errors, backs off exponentially
           (capped at 16s, +jitter) honoring Retry-After when present.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
@@ -2370,34 +2368,6 @@ class OpenAIBackendAPI:
         last_task_error = ""
         while _remaining() > 0:
             attempt += 1
-            # /backend-api/tasks 错误检查降频：仅在第 1 次、每第 3 次或接近 deadline 时查询，
-            # 减少高并发下的上游请求量（仅记录，不中断；
-            # 内容政策违规检测通过对话文本进行，见 _find_content_policy_error_in_conversation）
-            near_deadline = _remaining() < interval * 2
-            if attempt == 1 or attempt % 3 == 0 or near_deadline:
-                last_task_error = ""
-                try:
-                    tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                    for task in tasks:
-                        is_error, error_msg, metadata = self.check_task_error(task)
-                        if is_error and error_msg:
-                            last_task_error = error_msg
-                            logger.info({
-                                "event": "image_poll_task_error_not_blocking",
-                                "conversation_id": conversation_id,
-                                "attempt": attempt,
-                                "error_msg": error_msg,
-                                "metadata": metadata,
-                            })
-                except Exception as exc:
-                    # tasks 查询失败不影响正常轮询流程
-                    logger.debug({
-                        "event": "image_poll_task_check_failed",
-                        "conversation_id": conversation_id,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    })
-
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
@@ -2433,6 +2403,31 @@ class OpenAIBackendAPI:
                         "error_msg": policy_msg[:200],
                     })
                     raise ImageContentPolicyError(policy_msg, conversation_id or "")
+
+                # 首轮先看对话结果；图片已经就绪时不必串行等待 tasks 接口。
+                near_deadline = _remaining() < interval * 2
+                if attempt == 1 or attempt % 3 == 0 or near_deadline:
+                    last_task_error = ""
+                    try:
+                        tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                        for task in tasks:
+                            is_error, error_msg, metadata = self.check_task_error(task)
+                            if is_error and error_msg:
+                                last_task_error = error_msg
+                                logger.info({
+                                    "event": "image_poll_task_error_not_blocking",
+                                    "conversation_id": conversation_id,
+                                    "attempt": attempt,
+                                    "error_msg": error_msg,
+                                    "metadata": metadata,
+                                })
+                    except Exception as exc:
+                        logger.debug({
+                            "event": "image_poll_task_check_failed",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "error": str(exc),
+                        })
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})

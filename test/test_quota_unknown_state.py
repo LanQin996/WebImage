@@ -131,6 +131,27 @@ class QuotaUnknownStateTests(unittest.TestCase):
         self.assertTrue(_is_valid(unknown, 1, "web"))
         self.assertFalse(_is_valid(exhausted, 1, "web"))
 
+    def test_limits_progress_without_image_gen_is_still_unknown(self) -> None:
+        """降级响应可能带回别的 feature 但缺 image_gen，不能据此判定已耗尽。"""
+        self.service.add_account_items([
+            {
+                "access_token": "token-no-image-gen",
+                "status": "正常",
+                "quota": 0,
+                "limits_progress": [{"feature_name": "gpt-4", "remaining": 3}],
+            },
+        ])
+        account = self.service.get_account("token-no-image-gen")
+
+        self.assertFalse(self.service._quota_known(account))
+        self.assertTrue(self.service._is_image_account_available(account))
+        self.assertEqual(self.service._remaining_quota_locked("token-no-image-gen"), 1)
+        self.assertEqual(self.service.list_unknown_quota_tokens(), ["token-no-image-gen"])
+        self.assertEqual(self.service.unknown_quota_count(), 1)
+        self.assertTrue(_is_valid(account, 1, "web"))
+        # 对照：同样 quota=0，但带 image_gen 条目才算真耗尽
+        self.assertTrue(self.service._quota_known({"quota": 0, "limits_progress": [_image_gen(0)]}))
+
     def test_refresh_failure_is_visible_on_account(self) -> None:
         self.service.add_accounts(["token-refresh-failed"])
 

@@ -6,8 +6,9 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_outputs
 from services.protocol.openai_v1_response import stream_image_response
+from utils.helper import UpstreamHTTPError
 
 
 def _conversation(file_ids: list[str], sediment_ids: list[str] | None = None) -> dict:
@@ -132,6 +133,83 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(file_ids, ["file-one", "file-two"])
         self.assertEqual(sediment_ids, ["sed-one"])
         self.assertEqual(backend.calls, 3)
+
+    def test_poll_returns_ready_image_before_querying_tasks(self) -> None:
+        backend = FakeBackend([_conversation(["file-ready"])])
+        with (
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_check_before_hit_enabled": False,
+            }),
+            mock.patch.object(backend, "_query_backend_tasks") as query_tasks,
+        ):
+            result = backend._poll_image_results("conv-1", timeout_secs=10)
+
+        self.assertEqual(result, (["file-ready"], []))
+        query_tasks.assert_not_called()
+
+    def test_poll_queries_tasks_only_after_empty_conversation(self) -> None:
+        backend = FakeBackend([_conversation([]), _conversation(["file-ready"])])
+        calls: list[str] = []
+        original_get = backend._get_conversation
+
+        def get_conversation(conversation_id: str) -> dict:
+            calls.append("conversation")
+            return original_get(conversation_id)
+
+        def query_tasks(**_kwargs: object) -> list[dict]:
+            calls.append("tasks")
+            return []
+
+        with (
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_poll_interval_secs": 0.5,
+                "image_check_before_hit_enabled": False,
+            }),
+            mock.patch.object(backend, "_get_conversation", side_effect=get_conversation),
+            mock.patch.object(backend, "_query_backend_tasks", side_effect=query_tasks),
+            mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
+        ):
+            result = backend._poll_image_results("conv-1", timeout_secs=10)
+
+        self.assertEqual(result, (["file-ready"], []))
+        self.assertEqual(calls, ["conversation", "tasks", "conversation"])
+
+    def test_poll_honors_retry_after_when_early_check_is_rate_limited(self) -> None:
+        backend = FakeBackend()
+        with (
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_check_before_hit_enabled": False,
+            }),
+            mock.patch.object(backend, "_get_conversation", side_effect=[
+                UpstreamHTTPError("conversation", 429, "busy", retry_after=1),
+                _conversation(["file-ready"]),
+            ]),
+            mock.patch("services.openai_backend_api.random.uniform", return_value=0),
+            mock.patch("services.openai_backend_api.time.sleep") as sleep,
+        ):
+            result = backend._poll_image_results("conv-1", timeout_secs=10)
+
+        self.assertEqual(result, (["file-ready"], []))
+        sleep.assert_called_once_with(1)
+
+    def test_image_tool_stream_skips_preliminary_task_query(self) -> None:
+        backend = FakeBackend()
+        event = {
+            "type": "conversation.done", "conversation_id": "conv-1", "file_ids": [],
+            "sediment_ids": [], "text": "", "turn_use_case": "image gen",
+        }
+        with (
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter([event])),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks") as query_error,
+            mock.patch.object(backend, "resolve_conversation_image_urls", side_effect=RuntimeError("poll reached")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "poll reached"):
+                list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2", prompt="test")))
+
+        query_error.assert_not_called()
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()

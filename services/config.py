@@ -591,19 +591,17 @@ class ConfigStore:
     @property
     def image_poll_interval_secs(self) -> float:
         try:
-            return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
+            return max(0.5, float(self.data.get("image_poll_interval_secs", 3.0)))
         except (TypeError, ValueError):
-            return 10.0
+            return 3.0
 
     @property
     def image_poll_initial_wait_secs(self) -> float:
-        """Image generation upstream takes ~30s; polling immediately wastes requests
-        and trips a transient 429. Default 10s gives the conversation document time
-        to commit before the first poll."""
+        """Give the conversation document a short commit window after the SSE closes."""
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 10.0)))
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 2.0)))
         except (TypeError, ValueError):
-            return 10.0
+            return 2.0
 
     @property
     def image_account_concurrency(self) -> int:
